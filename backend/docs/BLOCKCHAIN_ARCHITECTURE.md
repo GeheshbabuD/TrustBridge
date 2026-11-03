@@ -1,0 +1,7 @@
+# Blockchain Architecture
+
+Blockchain is an optional tamper-evidence layer, not proof of custody. Select a network only after cost, privacy, finality, reliability and legal review. Hash canonical important events and store minimum commitments/references. Keep personal data, credentials, payment data and evidence off-chain; assess hash leakage.
+
+A local Solidity prototype may record role-authorized state references and emit events, but must not custody real funds. Use durable outbox, idempotency, retries, confirmation/reorg policy and reconciliation. Compare event hashes and chain references; inconsistent or failed writes stay pending/failed, never reported as completed escrow. Keep signing keys outside source/logs in managed custody, scope signer privileges, define rotation/recovery and contract/network allowlist. Test locally first. Testnet needs approval/credentials. Mainnet/funds require independent audit, key management, incident response and legal review.
+
+TB-BE-024 adds the persistence-only `BlockchainRecord`: transaction-scoped idempotency, network/contract reference, operation type, event hash, optional transaction/block references, status and safe error code. Multiple records per transaction are valid. It contains no raw payload or signing secrets. `SUBMITTED` and even a stored transaction hash do not establish confirmation or finality; later verification/reorg monitoring and reconciliation must govern confirmed status. No chain SDK or execution was added.

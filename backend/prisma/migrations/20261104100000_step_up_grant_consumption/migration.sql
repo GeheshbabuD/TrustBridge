@@ -1,0 +1,1 @@
+ALTER TABLE "mfa_challenges" ADD COLUMN "grant_consumed_at" TIMESTAMPTZ(6);
