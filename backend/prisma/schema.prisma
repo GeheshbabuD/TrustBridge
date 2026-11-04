@@ -33,6 +33,8 @@ enum MfaChallengePurpose {
   LOGIN
   STEP_UP
   ACCOUNT_RECOVERY
+  LEGACY_ADMIN_MFA_ENROLL
+  LEGACY_ADMIN_MFA_VERIFY
 }
 
 enum MfaAssuranceLevel {
@@ -79,6 +81,28 @@ enum TransactionStatus {
   REJECTED
 }
 
+enum TermsVersionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  SUPERSEDED
+  // Marks a snapshot inferred from a transaction that was already beyond
+  // CREATED before explicit terms decisions were persisted.
+  LEGACY_ACCEPTED
+}
+
+enum TermsDecision {
+  ACCEPTED
+  REJECTED
+}
+
+enum TransactionInvitationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  REVOKED
+}
+
 enum PaymentAttemptStatus {
   CREATED
   PENDING
@@ -108,6 +132,12 @@ enum ProviderOperationStatus {
   PENDING
   SUCCEEDED
   FAILED
+}
+
+enum EscrowOperationType {
+  FUNDING
+  RELEASE
+  REFUND
 }
 
 enum WebhookProcessingStatus {
@@ -171,26 +201,31 @@ model User {
   createdAt    DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt    DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  profile                   Profile?
-  buyerTransactions         Transaction[]              @relation("TransactionBuyer")
-  sellerTransactions        Transaction[]              @relation("TransactionSeller")
-  createdTransactions       Transaction[]              @relation("TransactionCreator")
-  transactionParticipants   TransactionParticipant[]
-  openedDisputes            Dispute[]                  @relation("DisputeOpenedBy")
-  resolvedDisputes          Dispute[]                  @relation("DisputeResolvedBy")
-  uploadedEvidence          Evidence[]                 @relation("EvidenceUploader")
-  notifications             Notification[]             @relation("NotificationRecipient")
-  auditLogs                 AuditLog[]                 @relation("AuditActor")
-  riskAssessmentsReviewed   RiskAssessment[]           @relation("RiskAssessmentReviewer")
-  aiAnalysesReviewed        AIAnalysis[]               @relation("AIAnalysisReviewer")
-  refreshTokens             RefreshToken[]             @relation("RefreshTokenUser")
-  transactionStatusHistory  TransactionStatusHistory[] @relation("TransactionHistoryActor")
-  mfa                       UserMfa?
-  mfaChallenges             MfaChallenge[]
-  mfaRecoveryCodes          MfaRecoveryCode[]
-  accountRecoveryRequests   AccountRecoveryRequest[]   @relation("RecoverySubject")
-  initiatedRecoveryRequests AccountRecoveryRequest[]   @relation("RecoveryRequester")
-  recoveryApprovals         RecoveryApproval[]
+  profile                        Profile?
+  buyerTransactions              Transaction[]              @relation("TransactionBuyer")
+  sellerTransactions             Transaction[]              @relation("TransactionSeller")
+  createdTransactions            Transaction[]              @relation("TransactionCreator")
+  transactionParticipants        TransactionParticipant[]
+  openedDisputes                 Dispute[]                  @relation("DisputeOpenedBy")
+  resolvedDisputes               Dispute[]                  @relation("DisputeResolvedBy")
+  uploadedEvidence               Evidence[]                 @relation("EvidenceUploader")
+  notifications                  Notification[]             @relation("NotificationRecipient")
+  auditLogs                      AuditLog[]                 @relation("AuditActor")
+  riskAssessmentsReviewed        RiskAssessment[]           @relation("RiskAssessmentReviewer")
+  aiAnalysesReviewed             AIAnalysis[]               @relation("AIAnalysisReviewer")
+  refreshTokens                  RefreshToken[]             @relation("RefreshTokenUser")
+  transactionStatusHistory       TransactionStatusHistory[] @relation("TransactionHistoryActor")
+  mfa                            UserMfa?
+  mfaChallenges                  MfaChallenge[]
+  mfaRecoveryCodes               MfaRecoveryCode[]
+  accountRecoveryRequests        AccountRecoveryRequest[]   @relation("RecoverySubject")
+  initiatedRecoveryRequests      AccountRecoveryRequest[]   @relation("RecoveryRequester")
+  recoveryApprovals              RecoveryApproval[]
+  proposedTransactionTerms       TransactionTermsVersion[]  @relation("TransactionTermsProposer")
+  transactionTermsDecisions      TransactionTermsDecision[] @relation("TransactionTermsDecisionActor")
+  sentTransactionInvitations     TransactionInvitation[]    @relation("TransactionInvitationInviter")
+  receivedTransactionInvitations TransactionInvitation[]    @relation("TransactionInvitationInvitee")
+  escrowOperations               EscrowOperation[]          @relation("EscrowOperationActor")
 
   @@index([status, createdAt], map: "users_status_created_at_idx")
   @@index([role, status], map: "users_role_status_idx")
@@ -198,11 +233,13 @@ model User {
 }
 
 model Profile {
-  id          String   @id @default(uuid()) @db.Uuid
-  userId      String   @unique(map: "profiles_user_id_key") @map("user_id") @db.Uuid
-  displayName String?  @map("display_name") @db.VarChar(120)
-  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt   DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  id                      String   @id @default(uuid()) @db.Uuid
+  userId                  String   @unique(map: "profiles_user_id_key") @map("user_id") @db.Uuid
+  displayName             String?  @map("display_name") @db.VarChar(120)
+  preferences             Json     @default("{}") @db.JsonB
+  notificationPreferences Json     @default("{}") @map("notification_preferences") @db.JsonB
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt               DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   user User @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
 
@@ -236,6 +273,9 @@ model Transaction {
   blockchainRecords BlockchainRecord[]
   statusHistory     TransactionStatusHistory[]
   outboxEvents      OutboxEvent[]
+  termsVersions     TransactionTermsVersion[]
+  invitations       TransactionInvitation[]
+  escrowOperations  EscrowOperation[]
 
   // Composite references below keep all transaction-bound financial rows in
   // this transaction's currency. id is already primary; this key supports FKs.
@@ -245,6 +285,66 @@ model Transaction {
   @@index([status, createdAt], map: "transactions_status_created_idx")
   @@index([createdById, createdAt], map: "transactions_creator_created_idx")
   @@map("transactions")
+}
+
+model TransactionTermsVersion {
+  id            String             @id @default(uuid()) @db.Uuid
+  transactionId String             @map("transaction_id") @db.Uuid
+  version       Int
+  proposedById  String             @map("proposed_by_id") @db.Uuid
+  amountMinor   BigInt             @map("amount_minor")
+  currency      String             @db.Char(3)
+  details       Json               @db.JsonB
+  status        TermsVersionStatus @default(PENDING)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transaction Transaction                @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  proposedBy  User                       @relation("TransactionTermsProposer", fields: [proposedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  decisions   TransactionTermsDecision[]
+
+  @@unique([transactionId, version], map: "transaction_terms_versions_transaction_version_key")
+  @@index([transactionId, status, version], map: "transaction_terms_versions_lookup_idx")
+  @@index([proposedById, createdAt], map: "transaction_terms_versions_proposer_idx")
+  @@map("transaction_terms_versions")
+}
+
+model TransactionTermsDecision {
+  id             String        @id @default(uuid()) @db.Uuid
+  termsVersionId String        @map("terms_version_id") @db.Uuid
+  actorUserId    String        @map("actor_user_id") @db.Uuid
+  decision       TermsDecision
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  termsVersion TransactionTermsVersion @relation(fields: [termsVersionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  actor        User                    @relation("TransactionTermsDecisionActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([termsVersionId, actorUserId], map: "transaction_terms_decisions_version_actor_key")
+  @@index([actorUserId, createdAt], map: "transaction_terms_decisions_actor_created_idx")
+  @@map("transaction_terms_decisions")
+}
+
+model TransactionInvitation {
+  id            String                      @id @default(uuid()) @db.Uuid
+  transactionId String                      @map("transaction_id") @db.Uuid
+  inviterId     String                      @map("inviter_id") @db.Uuid
+  inviteeId     String                      @map("invitee_id") @db.Uuid
+  tokenHash     String                      @unique(map: "transaction_invitations_token_hash_key") @map("token_hash") @db.Char(64)
+  status        TransactionInvitationStatus @default(PENDING)
+  expiresAt     DateTime                    @map("expires_at") @db.Timestamptz(6)
+  acceptedAt    DateTime?                   @map("accepted_at") @db.Timestamptz(6)
+  rejectedAt    DateTime?                   @map("rejected_at") @db.Timestamptz(6)
+  revokedAt     DateTime?                   @map("revoked_at") @db.Timestamptz(6)
+  createdAt     DateTime                    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime                    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  inviter     User        @relation("TransactionInvitationInviter", fields: [inviterId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  invitee     User        @relation("TransactionInvitationInvitee", fields: [inviteeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([transactionId, status, createdAt], map: "transaction_invitations_transaction_status_idx")
+  @@index([inviteeId, status, expiresAt], map: "transaction_invitations_invitee_expiry_idx")
+  @@map("transaction_invitations")
 }
 
 model TransactionParticipant {
@@ -275,8 +375,9 @@ model PaymentAttempt {
   createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt         DateTime             @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  transaction   Transaction    @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
-  webhookEvents WebhookEvent[]
+  transaction      Transaction       @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
+  webhookEvents    WebhookEvent[]
+  escrowOperations EscrowOperation[]
 
   @@unique([transactionId, idempotencyKey], map: "payment_attempts_transaction_idempotency_key")
   @@unique([provider, providerReference], map: "payment_attempts_provider_reference_key")
@@ -298,8 +399,9 @@ model Escrow {
   createdAt     DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt     DateTime     @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  transaction   Transaction    @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
-  ledgerAccount LedgerAccount? @relation("EscrowLedgerAccount")
+  transaction   Transaction       @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
+  ledgerAccount LedgerAccount?    @relation("EscrowLedgerAccount")
+  operations    EscrowOperation[]
 
   @@unique([id, transactionId, currency], map: "escrows_id_transaction_currency_key")
   @@unique([transactionId, currency], map: "escrows_transaction_currency_key")
@@ -336,10 +438,11 @@ model LedgerJournal {
   reversalOfJournalId String?  @map("reversal_of_journal_id") @db.Uuid
   createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  transaction Transaction     @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
-  entries     LedgerEntry[]
-  reversalOf  LedgerJournal?  @relation("LedgerJournalReversal", fields: [reversalOfJournalId, transactionId, currency], references: [id, transactionId, currency], onDelete: Restrict, onUpdate: Restrict)
-  reversals   LedgerJournal[] @relation("LedgerJournalReversal")
+  transaction      Transaction       @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
+  entries          LedgerEntry[]
+  reversalOf       LedgerJournal?    @relation("LedgerJournalReversal", fields: [reversalOfJournalId, transactionId, currency], references: [id, transactionId, currency], onDelete: Restrict, onUpdate: Restrict)
+  reversals        LedgerJournal[]   @relation("LedgerJournalReversal")
+  escrowOperations EscrowOperation[]
 
   @@unique([id, transactionId, currency], map: "ledger_journals_id_transaction_currency_key")
   @@index([transactionId, createdAt], map: "ledger_journals_transaction_created_idx")
@@ -363,6 +466,48 @@ model LedgerEntry {
   @@index([journalId, transactionId, currency], map: "ledger_entries_journal_transaction_currency_idx")
   @@index([accountId, transactionId, currency, createdAt], map: "ledger_entries_account_transaction_currency_created_idx")
   @@map("ledger_entries")
+}
+
+// Durable authorization/execution envelope. Provider execution is separate;
+// internal escrow remains an accounting record, not legal custody.
+model EscrowOperation {
+  id                String                  @id @default(uuid()) @db.Uuid
+  transactionId     String                  @map("transaction_id") @db.Uuid
+  escrowId          String                  @map("escrow_id") @db.Uuid
+  paymentAttemptId  String?                 @unique(map: "escrow_operations_payment_attempt_key") @map("payment_attempt_id") @db.Uuid
+  ledgerJournalId   String?                 @unique(map: "escrow_operations_ledger_journal_key") @map("ledger_journal_id") @db.Uuid
+  actorUserId       String?                 @map("actor_user_id") @db.Uuid
+  type              EscrowOperationType
+  status            ProviderOperationStatus @default(PENDING)
+  idempotencyKey    String                  @map("idempotency_key") @db.VarChar(128)
+  operationKey      String                  @unique(map: "escrow_operations_operation_key_key") @map("operation_key") @db.VarChar(160)
+  provider          String?                 @db.VarChar(64)
+  providerReference String?                 @map("provider_reference") @db.VarChar(255)
+  amountMinor       BigInt                  @map("amount_minor")
+  currency          String                  @db.Char(3)
+  reasonCode        String                  @map("reason_code") @db.VarChar(100)
+  failureCode       String?                 @map("failure_code") @db.VarChar(100)
+  attemptCount      Int                     @default(0) @map("attempt_count")
+  nextAttemptAt     DateTime                @default(now()) @map("next_attempt_at") @db.Timestamptz(6)
+  leaseOwner        String?                 @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt    DateTime?               @map("lease_expires_at") @db.Timestamptz(6)
+  authorizedAt      DateTime                @default(now()) @map("authorized_at") @db.Timestamptz(6)
+  completedAt       DateTime?               @map("completed_at") @db.Timestamptz(6)
+  createdAt         DateTime                @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt         DateTime                @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transaction    Transaction     @relation(fields: [transactionId, currency], references: [id, currency], onDelete: Restrict, onUpdate: Restrict)
+  escrow         Escrow          @relation(fields: [escrowId, transactionId, currency], references: [id, transactionId, currency], onDelete: Restrict, onUpdate: Restrict)
+  paymentAttempt PaymentAttempt? @relation(fields: [paymentAttemptId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  ledgerJournal  LedgerJournal?  @relation(fields: [ledgerJournalId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  actor          User?           @relation("EscrowOperationActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([transactionId, idempotencyKey], map: "escrow_operations_transaction_idempotency_key")
+  @@index([transactionId, type, status, createdAt], map: "escrow_operations_transaction_type_status_idx")
+  @@index([escrowId, status, createdAt], map: "escrow_operations_escrow_status_created_idx")
+  @@index([status, updatedAt], map: "escrow_operations_status_updated_idx")
+  @@index([status, nextAttemptAt, leaseExpiresAt], map: "escrow_operations_retry_lease_idx")
+  @@map("escrow_operations")
 }
 
 model Dispute {
@@ -664,20 +809,20 @@ model BlockchainRecord {
 // Only a one-way token hash is persisted. Self-reference retains rotation
 // lineage and supports future reuse detection; raw credentials are never stored.
 model RefreshToken {
-  id               String    @id @default(uuid()) @db.Uuid
-  userId           String    @map("user_id") @db.Uuid
-  tokenHash        String    @unique(map: "refresh_tokens_token_hash_key") @map("token_hash") @db.VarChar(128)
-  familyId         String    @map("family_id") @db.Uuid
-  authVersion      Int       @default(0) @map("auth_version")
-  mfaVerifiedAt    DateTime? @map("mfa_verified_at") @db.Timestamptz(6)
+  id               String            @id @default(uuid()) @db.Uuid
+  userId           String            @map("user_id") @db.Uuid
+  tokenHash        String            @unique(map: "refresh_tokens_token_hash_key") @map("token_hash") @db.VarChar(128)
+  familyId         String            @map("family_id") @db.Uuid
+  authVersion      Int               @default(0) @map("auth_version")
+  mfaVerifiedAt    DateTime?         @map("mfa_verified_at") @db.Timestamptz(6)
   assuranceLevel   MfaAssuranceLevel @default(PASSWORD_ONLY) @map("assurance_level")
-  rotatedFromId    String?   @unique(map: "refresh_tokens_rotated_from_key") @map("rotated_from_id") @db.Uuid
-  expiresAt        DateTime  @map("expires_at") @db.Timestamptz(6)
-  revokedAt        DateTime? @map("revoked_at") @db.Timestamptz(6)
-  revocationReason String?   @map("revocation_reason") @db.VarChar(100)
-  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
-  lastUsedAt       DateTime? @map("last_used_at") @db.Timestamptz(6)
-  reuseDetectedAt  DateTime? @map("reuse_detected_at") @db.Timestamptz(6)
+  rotatedFromId    String?           @unique(map: "refresh_tokens_rotated_from_key") @map("rotated_from_id") @db.Uuid
+  expiresAt        DateTime          @map("expires_at") @db.Timestamptz(6)
+  revokedAt        DateTime?         @map("revoked_at") @db.Timestamptz(6)
+  revocationReason String?           @map("revocation_reason") @db.VarChar(100)
+  createdAt        DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastUsedAt       DateTime?         @map("last_used_at") @db.Timestamptz(6)
+  reuseDetectedAt  DateTime?         @map("reuse_detected_at") @db.Timestamptz(6)
 
   user             User           @relation("RefreshTokenUser", fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   rotatedFrom      RefreshToken?  @relation("RefreshTokenRotation", fields: [rotatedFromId], references: [id], onDelete: Restrict, onUpdate: Restrict)

@@ -114,6 +114,11 @@ const environmentSchema = z
       .default("100")
       .transform(Number)
       .pipe(z.number().int().min(1).max(10000)),
+    RATE_LIMIT_STORE: z.enum(["memory", "redis"]).default("memory"),
+    REDIS_URL: z.string().trim().url().refine((value) => {
+      try { return ["redis:", "rediss:"].includes(new URL(value).protocol); } catch { return false; }
+    }).optional(),
+    RATE_LIMIT_KEY_SECRET: secretSchema.optional(),
     BCRYPT_SALT_ROUNDS: z
       .string()
       .regex(/^\d+$/)
@@ -130,6 +135,9 @@ const environmentSchema = z
     JWT_ISSUER: z.string().trim().min(1).default("trustbridge-api"),
     JWT_AUDIENCE: z.string().trim().min(1).default("trustbridge-client"),
     MFA_LOCAL_ENCRYPTION_KEY: localMfaKeySchema.optional(),
+    MFA_ENCRYPTION_PROVIDER: z.enum(["local", "kms"]).default("local"),
+    MFA_KMS_KEY_ID: z.string().trim().min(1).max(128).optional(),
+    MFA_KMS_KEY_VERSION: z.string().regex(/^[1-9]\d{0,8}$/).transform(Number).pipe(z.number().int().positive()).optional(),
     MFA_TOTP_WINDOW_STEPS: z.string().regex(/^\d+$/).default("1").transform(Number).pipe(z.number().int().min(0).max(2)),
     MFA_VERIFY_RATE_LIMIT_WINDOW_MS: z.string().regex(/^\d+$/).default("600000").transform(Number).pipe(z.number().int().min(1000).max(3600000)),
     MFA_VERIFY_RATE_LIMIT_MAX: z.string().regex(/^\d+$/).default("5").transform(Number).pipe(z.number().int().min(1).max(20)),
@@ -172,6 +180,33 @@ const environmentSchema = z
     if (config.NODE_ENV === "production" && config.MFA_LOCAL_ENCRYPTION_KEY) {
       context.addIssue({ code: "custom", path: ["MFA_LOCAL_ENCRYPTION_KEY"] });
     }
+    if (config.NODE_ENV === "production") {
+      if (config.MFA_ENCRYPTION_PROVIDER !== "kms") context.addIssue({ code: "custom", path: ["MFA_ENCRYPTION_PROVIDER"] });
+      if (!config.MFA_KMS_KEY_ID) context.addIssue({ code: "custom", path: ["MFA_KMS_KEY_ID"] });
+      if (!config.MFA_KMS_KEY_VERSION) context.addIssue({ code: "custom", path: ["MFA_KMS_KEY_VERSION"] });
+    }
+    if (config.MFA_ENCRYPTION_PROVIDER === "kms" && (!config.MFA_KMS_KEY_ID || !config.MFA_KMS_KEY_VERSION)) {
+      if (!config.MFA_KMS_KEY_ID) context.addIssue({ code: "custom", path: ["MFA_KMS_KEY_ID"] });
+      if (!config.MFA_KMS_KEY_VERSION) context.addIssue({ code: "custom", path: ["MFA_KMS_KEY_VERSION"] });
+    }
+
+    if (config.NODE_ENV === "production") {
+      if (config.RATE_LIMIT_STORE !== "redis") context.addIssue({ code: "custom", path: ["RATE_LIMIT_STORE"] });
+      if (!config.REDIS_URL) context.addIssue({ code: "custom", path: ["REDIS_URL"] });
+      else {
+        const redisUrl = new URL(config.REDIS_URL);
+        if (redisUrl.protocol !== "rediss:" || !redisUrl.username || !redisUrl.password) {
+          context.addIssue({ code: "custom", path: ["REDIS_URL"] });
+        }
+      }
+      if (!config.RATE_LIMIT_KEY_SECRET) context.addIssue({ code: "custom", path: ["RATE_LIMIT_KEY_SECRET"] });
+      if (config.RATE_LIMIT_KEY_SECRET && [config.JWT_ACCESS_SECRET, config.JWT_REFRESH_SECRET].includes(config.RATE_LIMIT_KEY_SECRET)) {
+        context.addIssue({ code: "custom", path: ["RATE_LIMIT_KEY_SECRET"] });
+      }
+    }
+    if (config.RATE_LIMIT_STORE === "redis" && !config.REDIS_URL) {
+      context.addIssue({ code: "custom", path: ["REDIS_URL"] });
+    }
 
     if (config.AI_ENABLED) {
       if (!config.AI_PROVIDER) {
@@ -213,6 +248,9 @@ const safeFieldMessages = Object.freeze({
   CORS_ALLOWED_ORIGINS: "must be a comma-separated list of exact HTTP(S) origins without paths or wildcards",
   API_RATE_LIMIT_WINDOW_MS: "must be an integer from 1000 through 86400000 milliseconds",
   API_RATE_LIMIT_MAX: "must be an integer from 1 through 10000 requests",
+  RATE_LIMIT_STORE: "must be memory in development/test or redis in production",
+  REDIS_URL: "must be a valid Redis URL; production requires rediss with ACL username and password",
+  RATE_LIMIT_KEY_SECRET: "must be a distinct, non-placeholder secret of at least 32 characters and is required in production",
   BCRYPT_SALT_ROUNDS: "must be an integer from 12 through 15",
   DATABASE_URL: "must be a valid PostgreSQL URL",
   JWT_ACCESS_SECRET: "must be a distinct, non-placeholder secret of at least 32 characters",
@@ -223,6 +261,9 @@ const safeFieldMessages = Object.freeze({
   JWT_ISSUER: "must be non-empty",
   JWT_AUDIENCE: "must be non-empty",
   MFA_LOCAL_ENCRYPTION_KEY: "must be a base64-encoded 32-byte local development/test key and is forbidden in production",
+  MFA_ENCRYPTION_PROVIDER: "must be local in development/test or kms in production",
+  MFA_KMS_KEY_ID: "must identify the configured KMS key",
+  MFA_KMS_KEY_VERSION: "must be a positive integer key-envelope version",
   MFA_TOTP_WINDOW_STEPS: "must be an integer from 0 through 2 time steps",
   MFA_VERIFY_RATE_LIMIT_WINDOW_MS: "must be an integer from 1000 through 3600000 milliseconds",
   MFA_VERIFY_RATE_LIMIT_MAX: "must be an integer from 1 through 20 failed attempts",
@@ -298,6 +339,14 @@ const makeConfig = (values) => {
   const database = {};
   defineSecret(database, "url", values.DATABASE_URL);
 
+  const rateLimit = {
+    windowMs: values.API_RATE_LIMIT_WINDOW_MS,
+    max: values.API_RATE_LIMIT_MAX,
+    store: values.RATE_LIMIT_STORE,
+  };
+  defineSecret(rateLimit, "keySecret", values.RATE_LIMIT_KEY_SECRET ?? values.JWT_ACCESS_SECRET);
+  defineSecret(rateLimit, "redisUrl", values.REDIS_URL);
+
   const jwt = {
     accessTtl: values.JWT_ACCESS_TTL,
     refreshTtl: values.JWT_REFRESH_TTL,
@@ -309,6 +358,9 @@ const makeConfig = (values) => {
   defineSecret(jwt, "refreshSecret", values.JWT_REFRESH_SECRET);
 
   const mfa = {
+    encryptionProvider: values.MFA_ENCRYPTION_PROVIDER,
+    kmsKeyId: values.MFA_KMS_KEY_ID,
+    kmsKeyVersion: values.MFA_KMS_KEY_VERSION,
     localKeyConfigured: Boolean(values.MFA_LOCAL_ENCRYPTION_KEY),
     totpWindowSteps: values.MFA_TOTP_WINDOW_STEPS,
     verificationRateLimit: Object.freeze({ windowMs: values.MFA_VERIFY_RATE_LIMIT_WINDOW_MS, max: values.MFA_VERIFY_RATE_LIMIT_MAX }),
@@ -344,10 +396,7 @@ const makeConfig = (values) => {
     nodeEnv: values.NODE_ENV,
     port: values.PORT,
     corsAllowedOrigins: Object.freeze(values.CORS_ALLOWED_ORIGINS),
-    rateLimit: Object.freeze({
-      windowMs: values.API_RATE_LIMIT_WINDOW_MS,
-      max: values.API_RATE_LIMIT_MAX,
-    }),
+    rateLimit: Object.freeze(rateLimit),
     password: Object.freeze({ bcryptSaltRounds: values.BCRYPT_SALT_ROUNDS }),
     database: Object.freeze(database),
     jwt: Object.freeze(jwt),

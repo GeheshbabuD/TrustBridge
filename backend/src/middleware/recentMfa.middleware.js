@@ -20,7 +20,7 @@ export const createRecentMfaMiddleware = ({
   now = () => new Date(),
 } = {}) => async (request, _response, next) => {
   const auth = request.auth;
-  if (!auth || typeof auth.userId !== "string" || !auth.userId || auth.mfaEnabled !== true || !(auth.mfaVerifiedAt instanceof Date)) return next(denied());
+  if (!auth || typeof auth.userId !== "string" || !auth.userId || auth.assuranceLevel !== "TOTP_VERIFIED" || auth.mfaEnabled !== true || !(auth.mfaVerifiedAt instanceof Date)) return next(denied());
   const currentTime = now();
   const verifiedTime = auth.mfaVerifiedAt.getTime();
   if (!Number.isFinite(currentTime.getTime()) || !Number.isFinite(verifiedTime) || verifiedTime > currentTime.getTime()) return next(denied());

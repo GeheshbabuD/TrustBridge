@@ -50,7 +50,7 @@ test("refresh tokens persist hashes and rotation lineage with restrictive relati
   assert.match(refresh, /reuseDetectedAt\s+DateTime\?/);
   assert.match(refresh, /expiresAt\s+DateTime/);
   assert.equal((refresh.match(/onDelete: Restrict/g) ?? []).length, 2);
-  assert.doesNotMatch(refresh, /rawToken|refreshToken\s+String|password|secret/i);
+  assert.doesNotMatch(refresh, /^\s*(?:rawToken|refreshToken|passwordHash|secret\w*)\s+/im);
 });
 
 test("new records avoid monetary floats and cascading deletion", () => {

@@ -220,10 +220,28 @@ test("challenge verification issues a session only for persistence-verified acco
   const service = createAuthService({
     mfaService: { verifyLoginChallenge: async ({ challengeToken, code }) => {
       assert.equal(challengeToken, "opaque"); assert.equal(code, "123456");
-      return { userId: "user-1", authVersion: 7, mfaVerifiedAt: new Date("2026-01-01T00:00:00Z") };
+      return { userId: "user-1", authVersion: 7, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date("2026-01-01T00:00:00Z") };
     } },
     sessionService: { issueForUser: async (userId, options) => { issue = { userId, options }; return { accessToken: "signed", refreshToken: "opaque-refresh" }; } },
   });
   assert.deepEqual(await service.verifyLoginChallenge({ challengeToken: "opaque", code: "123456" }), { accessToken: "signed", refreshToken: "opaque-refresh" });
-  assert.deepEqual(issue, { userId: "user-1", options: { expectedAuthVersion: 7, mfaVerifiedAt: new Date("2026-01-01T00:00:00Z") } });
+  assert.deepEqual(issue, { userId: "user-1", options: { expectedAuthVersion: 7, mfaVerifiedAt: new Date("2026-01-01T00:00:00Z"), assuranceLevel: "TOTP_VERIFIED" } });
+});
+
+test("recovery-code login issues only recovery assurance and does not invent TOTP time", async () => {
+  let issued;
+  const service = createAuthService({
+    mfaService: { verifyLoginChallenge: async () => ({ userId: "user-1", authVersion: 7, assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null }) },
+    sessionService: { issueForUser: async (userId, options) => { issued = { userId, options }; return { accessToken: "signed", refreshToken: "opaque" }; } },
+  });
+  await service.verifyLoginChallenge({ challengeToken: "opaque", code: "a".repeat(32) });
+  assert.deepEqual(issued, { userId: "user-1", options: { expectedAuthVersion: 7, mfaVerifiedAt: null, assuranceLevel: "RECOVERY_CODE_VERIFIED" } });
+});
+
+test("authentication service fails closed for unknown assurance returned by verifier", async () => {
+  const service = createAuthService({
+    mfaService: { verifyLoginChallenge: async () => ({ userId: "user-1", authVersion: 7, assuranceLevel: "UNKNOWN", mfaVerifiedAt: null }) },
+    sessionService: { issueForUser: async () => { throw new Error("must not issue"); } },
+  });
+  await assert.rejects(service.verifyLoginChallenge({ challengeToken: "opaque", code: "123456" }), { code: "INVALID_MFA_CHALLENGE" });
 });

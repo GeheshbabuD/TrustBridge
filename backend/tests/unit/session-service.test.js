@@ -23,7 +23,7 @@ const makeStore = () => {
       return { ...row, user: { ...user }, rotatedTo: txRows.find((candidate) => candidate.rotatedFromId === row.id) ?? null };
     },
     create: async ({ data }) => {
-      const row = { id: `id-${txRows.length + 1}`, ...data, revokedAt: null, rotatedFromId: data.rotatedFromId ?? null, reuseDetectedAt: null };
+      const row = { id: `id-${txRows.length + 1}`, createdAt: new Date("2026-01-01T00:00:00Z"), ...data, revokedAt: null, rotatedFromId: data.rotatedFromId ?? null, reuseDetectedAt: null };
       txRows.push(row);
       return row;
     },
@@ -134,9 +134,11 @@ test("ADMIN and active-MFA accounts cannot receive password-only sessions; verif
   const verifiedAt = new Date("2026-01-01T00:00:00Z");
   const issued = await sessions.issueForUser("user-1", { mfaVerifiedAt: verifiedAt, expectedAuthVersion: 0 });
   assert.equal(store.rows[0].mfaVerifiedAt, verifiedAt);
+  assert.equal(store.rows[0].assuranceLevel, "TOTP_VERIFIED");
   assert.equal(store.rows[0].authVersion, 0);
   const refreshed = await sessions.refresh(issued.refreshToken);
   assert.equal(store.rows[1].mfaVerifiedAt, verifiedAt);
+  assert.equal(store.rows[1].assuranceLevel, "TOTP_VERIFIED");
   assert.equal(store.rows[1].authVersion, 0);
   assert.equal(refreshed.refreshToken.length, 43);
 });
@@ -155,17 +157,53 @@ test("issued access JWT assurance is backend signed, tied to the persisted refre
     now: () => new Date("2026-01-01T00:01:00Z"),
   });
   const verifiedAt = new Date("2026-01-01T00:00:30Z");
-  const issued = await sessions.issueForUser("user-1", { mfaVerifiedAt: verifiedAt });
+  const issued = await sessions.issueForUser("user-1", { mfaVerifiedAt: verifiedAt, assuranceLevel: "TOTP_VERIFIED" });
   const claims = verifyAccessToken(issued.accessToken, { environment, now: () => new Date("2026-01-01T00:01:00Z") });
   assert.equal(claims.userId, "user-1");
   assert.equal(claims.authVersion, 0);
   assert.equal(claims.sessionId, store.rows[0].id);
   assert.equal(claims.mfaVerifiedAt.getTime(), verifiedAt.getTime());
+  assert.equal(claims.assuranceLevel, "TOTP_VERIFIED");
 
   const refreshed = await sessions.refresh(issued.refreshToken);
   const refreshedClaims = verifyAccessToken(refreshed.accessToken, { environment, now: () => new Date("2026-01-01T00:01:00Z") });
   assert.equal(refreshedClaims.sessionId, store.rows[1].id);
   assert.equal(refreshedClaims.mfaVerifiedAt.getTime(), verifiedAt.getTime());
+  assert.equal(refreshedClaims.assuranceLevel, "TOTP_VERIFIED");
+});
+
+test("recovery-code assurance persists and survives refresh without a TOTP timestamp", async () => {
+  const store = makeStore();
+  store.user.mfa = { enrollmentStatus: "ENABLED", enabledAt: new Date("2026-01-01T00:00:00Z") };
+  const sessions = createSessionService({ getClient: async () => store.client, environment,
+    makeToken: (() => { let seq = 0; return () => Buffer.alloc(32, ++seq).toString("base64url"); })(),
+    now: () => new Date("2026-01-01T00:01:00Z") });
+  const issued = await sessions.issueForUser("user-1", { assuranceLevel: "RECOVERY_CODE_VERIFIED", expectedAuthVersion: 0 });
+  assert.equal(store.rows[0].assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(store.rows[0].mfaVerifiedAt, null);
+  const claims = verifyAccessToken(issued.accessToken, { environment, now: () => new Date("2026-01-01T00:01:00Z") });
+  assert.equal(claims.assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(claims.mfaVerifiedAt, null);
+  const rotated = await sessions.refresh(issued.refreshToken);
+  assert.equal(store.rows[1].assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(store.rows[1].mfaVerifiedAt, null);
+  const rotatedClaims = verifyAccessToken(rotated.accessToken, { environment, now: () => new Date("2026-01-01T00:01:00Z") });
+  assert.equal(rotatedClaims.assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(rotatedClaims.mfaVerifiedAt, null);
+});
+
+test("password-only issuance persists PASSWORD_ONLY", async () => {
+  const store = makeStore();
+  const issued = await serviceFor(store).issueForUser("user-1");
+  assert.equal(store.rows[0].assuranceLevel, "PASSWORD_ONLY");
+  assert.equal(store.rows[0].mfaVerifiedAt, null);
+  assert.equal(issued.tokenType, "Bearer");
+});
+
+test("session issuance rejects unknown or inconsistent assurance levels", async () => {
+  const sessions = serviceFor(makeStore());
+  await assert.rejects(sessions.issueForUser("user-1", { assuranceLevel: "UNKNOWN" }), { code: "INVALID_CREDENTIALS" });
+  await assert.rejects(sessions.issueForUser("user-1", { assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: new Date("2026-01-01") }), { code: "INVALID_CREDENTIALS" });
 });
 
 test("refresh rechecks account status, role policy and auth version and cannot upgrade assurance", async () => {

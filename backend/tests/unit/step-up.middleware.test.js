@@ -24,6 +24,7 @@ const auth = {
   authVersion: 2,
   role: "USER",
   mfaEnabled: true,
+  assuranceLevel: "TOTP_VERIFIED",
   mfaVerifiedAt: new Date("2026-01-01T00:00:00Z"),
 };
 
@@ -355,4 +356,19 @@ test("storage failures fail closed without exposing database details", async () 
   assert.ok(error);
   assert.equal(error.code, "MFA_STEP_UP_UNAVAILABLE");
   assert.doesNotMatch(error.message, /private DB detail/);
+});
+
+test("recovery-code session assurance cannot satisfy TOTP recent-MFA middleware", async () => {
+  let databaseLookups = 0;
+  const middleware = createStepUpAuthorizationMiddleware({
+    purpose: "TEST_ACTION",
+    purposeRegistry: registry,
+    resourceId,
+    now: () => now,
+    maxAgeSeconds: 300,
+    getClient: async () => { databaseLookups += 1; return {}; },
+  });
+  const error = await invoke(middleware, { auth: { ...auth, assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null } });
+  assert.equal(error.code, "MFA_ASSURANCE_REQUIRED");
+  assert.equal(databaseLookups, 0);
 });

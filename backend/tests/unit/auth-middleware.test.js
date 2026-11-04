@@ -25,14 +25,15 @@ test("Bearer middleware rejects missing/invalid JWTs and never queries user for 
 
 test("Bearer middleware trusts current database status and role, not token-supplied role", async () => {
   let query;
+  const session = { userId: "u1", authVersion: 0, assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null, createdAt: new Date("2026-01-01"), revokedAt: null, expiresAt: new Date("2027-01-01") };
   const middleware = createAuthenticationMiddleware({
-    getClient: async () => ({ user: { findUnique: async (args) => { query = args; return { id: "u1", role: "USER", status: "ACTIVE", authVersion: 0, mfa: null }; } } }),
-    verify: () => ({ userId: "u1", role: "ADMIN", authVersion: 0 }),
+    getClient: async () => ({ user: { findUnique: async (args) => { query = args; return { id: "u1", role: "USER", status: "ACTIVE", authVersion: 0, mfa: null }; } }, refreshToken: { findUnique: async () => session } }),
+    verify: () => ({ userId: "u1", role: "ADMIN", authVersion: 0, sessionId: "s1", assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null }),
   });
   const { request, nextValue } = await invoke(middleware, "Bearer valid");
   assert.equal(nextValue, undefined);
   assert.deepEqual(query.where, { id: "u1" });
-  assert.deepEqual(request.auth, { userId: "u1", role: "USER", authVersion: 0, mfaEnabled: false, mfaVerifiedAt: null, sessionId: null });
+  assert.deepEqual(request.auth, { userId: "u1", role: "USER", authVersion: 0, mfaEnabled: false, mfaVerifiedAt: null, assuranceLevel: "PASSWORD_ONLY", sessionId: "s1" });
 });
 
 test("inactive or missing users are denied", async () => {
@@ -48,37 +49,58 @@ test("inactive or missing users are denied", async () => {
 
 test("repeated authentication middleware in one request reuses the verified context", async () => {
   let queries = 0;
+  const session = { userId: "u1", authVersion: 0, assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null, createdAt: new Date("2026-01-01"), revokedAt: null, expiresAt: new Date("2027-01-01") };
   const middleware = createAuthenticationMiddleware({
-    getClient: async () => ({ user: { findUnique: async () => { queries += 1; return { id: "u1", role: "USER", status: "ACTIVE", authVersion: 0, mfa: null }; } } }),
-    verify: () => ({ userId: "u1", authVersion: 0 }),
+    getClient: async () => ({ user: { findUnique: async () => { queries += 1; return { id: "u1", role: "USER", status: "ACTIVE", authVersion: 0, mfa: null }; } }, refreshToken: { findUnique: async () => session } }),
+    verify: () => ({ userId: "u1", authVersion: 0, sessionId: "s1", assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null }),
   });
   const request = { get: () => "Bearer valid", body: { userId: "attacker", role: "ADMIN" } };
   await middleware(request, {}, () => {});
   await middleware(request, {}, () => {});
   assert.equal(queries, 1);
-  assert.deepEqual(request.auth, { userId: "u1", role: "USER", authVersion: 0, mfaEnabled: false, mfaVerifiedAt: null, sessionId: null });
+  assert.deepEqual(request.auth, { userId: "u1", role: "USER", authVersion: 0, mfaEnabled: false, mfaVerifiedAt: null, assuranceLevel: "PASSWORD_ONLY", sessionId: "s1" });
 });
 
 test("active-MFA accounts require session-bound MFA claims and current auth version", async () => {
   const verifiedAt = new Date("2026-01-01T00:00:00Z");
   const account = { id: "u1", role: "USER", status: "ACTIVE", authVersion: 3, mfa: { enrollmentStatus: "ENABLED", enabledAt: verifiedAt } };
-  const make = (claims, session = { userId: "u1", authVersion: 3, mfaVerifiedAt: verifiedAt }, currentUser = account) => createAuthenticationMiddleware({
+  const make = (claims, session = { userId: "u1", authVersion: 3, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt, createdAt: verifiedAt, expiresAt: new Date("2026-01-02T00:00:00Z") }, currentUser = account) => createAuthenticationMiddleware({
     getClient: async () => ({ user: { findUnique: async () => currentUser }, refreshToken: { findUnique: async () => session } }),
     verify: () => claims,
     now: () => verifiedAt,
   });
-  const valid = await invoke(make({ userId: "u1", authVersion: 3, sessionId: "s1", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, mfaVerifiedAt: verifiedAt, expiresAt: new Date("2026-01-02T00:00:00Z") }), "Bearer valid");
+  const valid = await invoke(make({ userId: "u1", authVersion: 3, sessionId: "s1", assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt, createdAt: verifiedAt, expiresAt: new Date("2026-01-02T00:00:00Z") }), "Bearer valid");
   assert.equal(valid.nextValue, undefined);
   assert.equal(valid.request.auth.mfaEnabled, true);
   assert.equal(valid.request.auth.mfaVerifiedAt.getTime(), verifiedAt.getTime());
+  assert.equal(valid.request.auth.assuranceLevel, "TOTP_VERIFIED");
 
   for (const middleware of [
-    make({ userId: "u1", authVersion: 3, sessionId: "s1", mfaVerifiedAt: null }, { userId: "u1", authVersion: 3, mfaVerifiedAt: null, expiresAt: new Date("2026-01-02T00:00:00Z") }),
+    make({ userId: "u1", authVersion: 3, sessionId: "s1", assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null }, { userId: "u1", authVersion: 3, assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null, expiresAt: new Date("2026-01-02T00:00:00Z"), createdAt: verifiedAt }),
     make({ userId: "u1", authVersion: 2, sessionId: "s1", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, mfaVerifiedAt: verifiedAt, expiresAt: new Date("2026-01-02T00:00:00Z") }),
-    make({ userId: "u1", authVersion: 3, sessionId: "s1", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, mfaVerifiedAt: null, expiresAt: new Date("2026-01-02T00:00:00Z") }),
-    make({ userId: "u1", authVersion: 3, sessionId: "s1", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, mfaVerifiedAt: verifiedAt, revokedAt: new Date(), expiresAt: new Date("2026-01-02T00:00:00Z") }),
+    make({ userId: "u1", authVersion: 3, sessionId: "s1", assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, assuranceLevel: "PASSWORD_ONLY", mfaVerifiedAt: null, expiresAt: new Date("2026-01-02T00:00:00Z"), createdAt: verifiedAt }),
+    make({ userId: "u1", authVersion: 3, sessionId: "s1", assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt }, { userId: "u1", authVersion: 3, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: verifiedAt, createdAt: verifiedAt, revokedAt: new Date(), expiresAt: new Date("2026-01-02T00:00:00Z") }),
   ]) {
     const result = await invoke(middleware, "Bearer valid");
     assert.equal(result.nextValue.statusCode, 401);
   }
+});
+
+test("authentication rejects assurance mismatch and allows recovery assurance without TOTP freshness", async () => {
+  const enabledAt = new Date("2026-01-01T00:00:00Z");
+  const user = { id: "u1", role: "USER", status: "ACTIVE", authVersion: 2, mfa: { enrollmentStatus: "ENABLED", enabledAt } };
+  const recoverySession = { userId: "u1", authVersion: 2, assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null, createdAt: new Date("2026-01-02"), expiresAt: new Date("2027-01-01"), revokedAt: null };
+  const make = (claims, session = recoverySession) => createAuthenticationMiddleware({
+    getClient: async () => ({ user: { findUnique: async () => user }, refreshToken: { findUnique: async () => session } }),
+    verify: () => claims, now: () => new Date("2026-02-01"),
+  });
+  const ok = await invoke(make({ userId: "u1", authVersion: 2, sessionId: "s1", assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null }), "Bearer valid");
+  assert.equal(ok.nextValue, undefined);
+  assert.equal(ok.request.auth.assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(ok.request.auth.mfaVerifiedAt, null);
+  for (const middleware of [
+    make({ userId: "u1", authVersion: 2, sessionId: "s1", assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: null }),
+    make({ userId: "u1", authVersion: 2, sessionId: "s1", assuranceLevel: "UNKNOWN", mfaVerifiedAt: null }),
+    make({ userId: "u1", authVersion: 2, sessionId: "s1", assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null }, { ...recoverySession, assuranceLevel: "PASSWORD_ONLY" }),
+  ]) assert.equal((await invoke(middleware, "Bearer valid")).nextValue.statusCode, 401);
 });

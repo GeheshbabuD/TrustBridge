@@ -6,6 +6,9 @@ const schema = await readFile(new URL("../../prisma/schema.prisma", import.meta.
 const migration = await readFile(new URL("../../prisma/migrations/20261103090000_mfa_persistence/migration.sql", import.meta.url), "utf8");
 const statusMigration = await readFile(new URL("../../prisma/migrations/20261103100000_mfa_enrollment_status/migration.sql", import.meta.url), "utf8");
 const stepUpMigration = await readFile(new URL("../../prisma/migrations/20261103170000_step_up_assurance/migration.sql", import.meta.url), "utf8");
+const assuranceMigration = await readFile(new URL("../../prisma/migrations/20261104110000_mfa_assurance_level/migration.sql", import.meta.url), "utf8");
+const legacyAdminEnrollmentMigration = await readFile(new URL("../../prisma/migrations/20261103190000_legacy_admin_mfa_enrollment/migration.sql", import.meta.url), "utf8");
+const legacyAdminVerifyMigration = await readFile(new URL("../../prisma/migrations/20261103191000_legacy_admin_mfa_verification/migration.sql", import.meta.url), "utf8");
 const modelBlock = (name) => {
   const match = schema.match(new RegExp(`model ${name} \\{([\\s\\S]*?)\\n\\}`));
   assert.ok(match, `Expected ${name} in canonical Prisma schema`);
@@ -46,11 +49,35 @@ test("durable MFA challenges and admin recovery require unique distinct approver
   assert.match(approval, /approver\s+User[\s\S]*onDelete: Restrict/);
 });
 
+test("legacy ADMIN enrollment authorizations use distinct additive purpose values", () => {
+  const enumBlock = schema.match(/enum MfaChallengePurpose \{([\s\S]*?)\n\}/)?.[1];
+  assert.ok(enumBlock);
+  for (const value of ["LOGIN", "STEP_UP", "ACCOUNT_RECOVERY", "LEGACY_ADMIN_MFA_ENROLL", "LEGACY_ADMIN_MFA_VERIFY"]) assert.match(enumBlock, new RegExp(`\\b${value}\\b`));
+  assert.match(legacyAdminEnrollmentMigration, /ALTER TYPE "MfaChallengePurpose" ADD VALUE 'LEGACY_ADMIN_MFA_ENROLL'/);
+  assert.match(legacyAdminVerifyMigration, /ALTER TYPE "MfaChallengePurpose" ADD VALUE 'LEGACY_ADMIN_MFA_VERIFY'/);
+  assert.doesNotMatch(`${legacyAdminEnrollmentMigration}\n${legacyAdminVerifyMigration}`, /\b(DROP|TRUNCATE|DELETE FROM|UPDATE)\b/i);
+});
+
 test("refresh records can later bind MFA assurance and account authorization version", () => {
   assert.match(modelBlock("User"), /authVersion\s+Int/);
   const refresh = modelBlock("RefreshToken");
   assert.match(refresh, /authVersion\s+Int/);
   assert.match(refresh, /mfaVerifiedAt\s+DateTime\?/);
+});
+
+test("persistent MFA assurance enum, mapped refresh field and legacy backfill are additive", () => {
+  assert.match(schema, /enum MfaAssuranceLevel\s*\{\s*PASSWORD_ONLY\s*TOTP_VERIFIED\s*RECOVERY_CODE_VERIFIED\s*\}/);
+  assert.equal((schema.match(/\bPASSWORD_ONLY\b/g) ?? []).length >= 1, true);
+  const refresh = modelBlock("RefreshToken");
+  assert.match(refresh, /assuranceLevel\s+MfaAssuranceLevel\s+@default\(PASSWORD_ONLY\)\s+@map\("assurance_level"\)/);
+  assert.match(refresh, /mfaVerifiedAt\s+DateTime\?\s+@map\("mfa_verified_at"\)/);
+  assert.match(assuranceMigration, /CREATE TYPE "MfaAssuranceLevel" AS ENUM/);
+  assert.match(assuranceMigration, /ALTER TABLE "refresh_tokens"\s+ADD COLUMN "assurance_level" "MfaAssuranceLevel" NOT NULL DEFAULT 'PASSWORD_ONLY'/);
+  assert.match(assuranceMigration, /WHEN "mfa_verified_at" IS NOT NULL THEN 'TOTP_VERIFIED'/);
+  assert.match(assuranceMigration, /ELSE 'PASSWORD_ONLY'/);
+  assert.match(assuranceMigration, /UPDATE "refresh_tokens"\s+SET "assurance_level" = CASE\s+WHEN "mfa_verified_at" IS NOT NULL THEN 'TOTP_VERIFIED'::"MfaAssuranceLevel"\s+ELSE 'PASSWORD_ONLY'::"MfaAssuranceLevel"\s+END;/);
+  assert.doesNotMatch(assuranceMigration, /\b(DROP|TRUNCATE|DELETE FROM)\b/i);
+  assert.doesNotMatch(assuranceMigration, /UPDATE\s+"refresh_tokens"[^;]*(mfa_verified_at\s*=|created_at\s*=|expires_at\s*=)/is);
 });
 
 test("step-up assurance schema binds a challenge to refresh session, purpose resource and MFA enrollment", () => {

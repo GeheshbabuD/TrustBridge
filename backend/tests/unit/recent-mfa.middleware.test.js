@@ -18,6 +18,7 @@ const auth = {
   authVersion: 2,
   role: "USER",
   mfaEnabled: true,
+  assuranceLevel: "TOTP_VERIFIED",
   mfaVerifiedAt: verifiedAt,
 };
 

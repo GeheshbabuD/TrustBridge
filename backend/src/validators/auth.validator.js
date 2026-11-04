@@ -65,5 +65,5 @@ export const logoutSchema = refreshSchema;
 
 export const mfaChallengeVerificationSchema = z.object({
   challengeToken: opaqueRefreshTokenSchema,
-  code: z.string().regex(/^\d{6}$/),
+  code: z.string().regex(/^(?:\d{6}|[a-f\d]{32})$/i),
 }).strict();

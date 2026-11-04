@@ -16,21 +16,32 @@ const environment = validateEnv({
 
 test("access JWT uses minimal claims and verifies configured issuer and audience", () => {
   const token = signAccessToken("user-123", { environment });
-  assert.deepEqual(verifyAccessToken(token, { environment }), { userId: "user-123", authVersion: 0, sessionId: null, mfaVerifiedAt: null });
+  assert.deepEqual(verifyAccessToken(token, { environment }), { userId: "user-123", authVersion: 0, sessionId: null, mfaVerifiedAt: null, assuranceLevel: "PASSWORD_ONLY" });
 });
 
 test("MFA assurance claims are backend signed, session bound and time validated", () => {
   const mfaVerifiedAt = new Date(Date.now() - 30_000);
-  const token = signAccessToken("user-123", { environment, authVersion: 4, sessionId: "session-1", mfaVerifiedAt });
+  const token = signAccessToken("user-123", { environment, authVersion: 4, sessionId: "session-1", mfaVerifiedAt, assuranceLevel: "TOTP_VERIFIED" });
   const claims = verifyAccessToken(token, { environment });
   assert.equal(claims.authVersion, 4);
   assert.equal(claims.sessionId, "session-1");
+  assert.equal(claims.assuranceLevel, "TOTP_VERIFIED");
   assert.equal(Math.floor(claims.mfaVerifiedAt.getTime() / 1000), Math.floor(mfaVerifiedAt.getTime() / 1000));
 
   const orphaned = jwt.sign({ sub: "user-1", av: 0, mfa_at: Math.floor(Date.now() / 1000) }, environment.jwt.accessSecret, {
     algorithm: "HS256", issuer: environment.jwt.issuer, audience: environment.jwt.audience, expiresIn: "1m",
   });
   assert.throws(() => verifyAccessToken(orphaned, { environment }));
+});
+
+test("JWT assurance claim is required, allowlisted and consistent with TOTP evidence", () => {
+  const issue = (claims) => jwt.sign({ sub: "user-1", av: 1, sid: "session-1", ...claims }, environment.jwt.accessSecret, {
+    algorithm: "HS256", issuer: environment.jwt.issuer, audience: environment.jwt.audience, expiresIn: "1m",
+  });
+  for (const token of [issue({}), issue({ al: "UNKNOWN" }), issue({ al: "RECOVERY_CODE_VERIFIED", mfa_at: Math.floor(Date.now() / 1000) }), issue({ al: "TOTP_VERIFIED" })]) {
+    assert.throws(() => verifyAccessToken(token, { environment }));
+  }
+  assert.equal(verifyAccessToken(issue({ al: "RECOVERY_CODE_VERIFIED" }), { environment }).assuranceLevel, "RECOVERY_CODE_VERIFIED");
 });
 
 test("an opaque MFA challenge token is not an access JWT", () => {

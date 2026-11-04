@@ -28,6 +28,8 @@ test("profile is one-to-one, contains minimal non-sensitive profile data and res
   assert.match(profile, /userId\s+String\s+@unique\(map: "profiles_user_id_key"\)/);
   assert.match(profile, /user\s+User\s+@relation\(fields: \[userId\], references: \[id\], onDelete: Restrict, onUpdate: Cascade\)/);
   assert.match(profile, /displayName\s+String\?/);
+  assert.match(profile, /preferences\s+Json\s+@default\("\{\}"\)\s+@db\.JsonB/);
+  assert.match(profile, /notificationPreferences\s+Json\s+@default\("\{\}"\)\s+@map\("notification_preferences"\)\s+@db\.JsonB/);
   assert.doesNotMatch(profile, /password|payment|evidence|token/i);
   assert.match(profile, /createdAt\s+DateTime/);
   assert.match(profile, /updatedAt\s+DateTime/);

@@ -4,7 +4,7 @@ import {
   createAuthService,
 } from "../services/auth.service.js";
 import { loginSchema, logoutSchema, mfaChallengeVerificationSchema, refreshSchema, registrationSchema } from "../validators/auth.validator.js";
-import { mfaEnrollmentSchema, mfaVerificationSchema } from "../validators/mfa.validator.js";
+import { legacyAdminEnrollmentStartSchema, legacyAdminEnrollmentVerifySchema, legacyAdminRecoveryRequestSchema, recoveryApprovalSchema, recoveryIdentityReferenceSchema, mfaEnrollmentSchema, mfaVerificationSchema } from "../validators/mfa.validator.js";
 import { stepUpChallengeSchema, stepUpVerificationSchema } from "../validators/step-up.validator.js";
 import { MfaServiceError } from "../services/mfa.service.js";
 
@@ -112,6 +112,111 @@ export const createAuthController = ({ authService = createAuthService(), sessio
     try {
       const status = await mfaService.getStatus({ userId: request.auth.userId });
       return response.status(200).json({ success: true, message: "MFA status", data: status });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  mfaRecoveryCodesRegenerate: async (request, response, next) => {
+    const parsed = mfaEnrollmentSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return next(validationError());
+    try {
+      const result = await mfaService.regenerateRecoveryCodes({ auth: request.auth, requestId: request.requestId });
+      return response.status(200).json({ success: true, message: "Recovery codes regenerated", data: { codes: result.codes } });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  mfaDisable: async (request, response, next) => {
+    const parsed = mfaEnrollmentSchema.safeParse(request.body ?? {});
+    if (!parsed.success) return next(validationError());
+    try {
+      const result = await mfaService.disableMfa({ auth: request.auth, requestId: request.requestId });
+      return response.status(200).json({ success: true, message: "MFA disabled", data: result });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  issueLegacyAdminEnrollmentAuthorization: async (request, response, next) => {
+    if (request.body && Object.keys(request.body).length) return next(validationError());
+    try {
+      const result = await mfaService.issueLegacyAdminEnrollmentAuthorization({ requestId: request.params.requestId, issuedByUserId: request.auth.userId });
+      return response.status(202).json({ success: true, message: "If the approved enrollment can be authorized, instructions will be delivered through the verified channel", data: { issued: result.issued, expiresAt: result.expiresAt } });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  createLegacyAdminEnrollmentRequest: async (request, response, next) => {
+    const parsed = legacyAdminRecoveryRequestSchema.safeParse(request.body);
+    if (!parsed.success) return next(validationError());
+    try {
+      const result = await mfaService.createLegacyAdminEnrollmentRequest({ targetUserId: parsed.data.targetUserId, requestedByUserId: request.auth.userId });
+      return response.status(202).json({ success: true, message: "Enrollment review request recorded", data: { requestId: result.id, expiresAt: result.expiresAt } });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  listLegacyAdminAccounts: async (_request, response, next) => {
+    try {
+      const accounts = await mfaService.listLegacyAdminAccounts();
+      return response.status(200).json({ success: true, message: "Legacy ADMIN MFA status", data: { accounts } });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  verifyLegacyAdminRecoveryIdentity: async (request, response, next) => {
+    const parsed = recoveryIdentityReferenceSchema.safeParse(request.body);
+    if (!parsed.success) return next(validationError());
+    try {
+      await mfaService.verifyLegacyAdminRecoveryIdentity({ requestId: request.params.requestId, evidenceReference: parsed.data.evidenceReference });
+      return response.status(200).json({ success: true, message: "Identity review completed", data: { verified: true } });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  approveLegacyAdminRecovery: async (request, response, next) => {
+    const parsed = recoveryApprovalSchema.safeParse(request.body);
+    if (!parsed.success) return next(validationError());
+    try {
+      const result = await mfaService.approveLegacyAdminRecovery({ requestId: request.params.requestId, approverId: request.auth.userId, ...parsed.data });
+      return response.status(200).json({ success: true, message: "Recovery decision recorded", data: result });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  startLegacyAdminEnrollment: async (request, response, next) => {
+    const parsed = legacyAdminEnrollmentStartSchema.safeParse(request.body);
+    if (!parsed.success) return next(validationError());
+    try {
+      const enrollment = await mfaService.startLegacyAdminEnrollment(parsed.data);
+      return response.status(201).json({ success: true, message: "MFA enrollment started", data: enrollment });
+    } catch (error) {
+      if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
+      return next(error);
+    }
+  },
+
+  verifyLegacyAdminEnrollment: async (request, response, next) => {
+    const parsed = legacyAdminEnrollmentVerifySchema.safeParse(request.body);
+    if (!parsed.success) return next(validationError());
+    try {
+      const result = await mfaService.verifyLegacyAdminEnrollment(parsed.data);
+      return response.status(200).json({ success: true, message: "MFA enrollment completed; sign in with your authenticator", data: { enabled: true, recoveryCodes: result.codes } });
     } catch (error) {
       if (error instanceof MfaServiceError) return next(new ApiError(error.statusCode, error.code, error.message));
       return next(error);

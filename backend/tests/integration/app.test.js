@@ -70,7 +70,7 @@ test("health endpoint returns the expected application status", async () => {
   });
 });
 
-test("liveness reports the process while readiness reports the unchecked database", async () => {
+test("liveness reports the process while readiness includes rate-limit store availability", async () => {
   await withHttpServer(async (baseUrl) => {
     const live = await fetch(`${baseUrl}/health/live`);
     assert.equal(live.status, 200);
@@ -86,13 +86,60 @@ test("liveness reports the process while readiness reports the unchecked databas
     assert.deepEqual(payload, {
       success: false,
       message: "Application readiness cannot be confirmed",
-      data: { status: "not_ready", checks: { database: "not_checked" } },
+      data: { status: "not_ready", checks: { database: "not_checked", rateLimitStore: "process_local", mfaEncryption: "not_required" } },
       error: { code: "READINESS_UNAVAILABLE" },
       requestId: ready.headers.get("x-request-id"),
     });
     assert.equal(JSON.stringify(payload).includes(process.env.DATABASE_URL), false);
     assert.equal(JSON.stringify(payload).includes("node_modules"), false);
   });
+});
+
+test("production readiness reports KMS unavailable without exposing provider details", async () => {
+  const production = validateEnv({
+    DATABASE_URL: "postgresql://test:test@localhost:5432/trustbridge_test",
+    NODE_ENV: "production",
+    JWT_ACCESS_SECRET: "production-access-secret-test-value-123456789",
+    JWT_REFRESH_SECRET: "production-refresh-secret-test-value-987654321",
+    RATE_LIMIT_STORE: "redis",
+    REDIS_URL: "rediss://acl-user:synthetic-password@redis.example.test:6380/0",
+    RATE_LIMIT_KEY_SECRET: "separate-production-rate-limit-key-123456789",
+    MFA_ENCRYPTION_PROVIDER: "kms",
+    MFA_KMS_KEY_ID: "test-kms-key",
+    MFA_KMS_KEY_VERSION: "1",
+  });
+  const readyApp = createApp(production, {
+    writeLog: () => {},
+    mfaService: { checkEncryptionAvailability: async () => { throw new Error("private KMS endpoint detail"); } },
+    rateLimitStore: { shared: true, increment: async () => ({ count: 1 }), healthCheck: async () => ({ available: true, shared: true }) },
+  });
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/health/ready`);
+    const payload = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(payload.data.checks.mfaEncryption, "unavailable");
+    assert.doesNotMatch(JSON.stringify(payload), /private KMS endpoint detail|synthetic-password/);
+  }, readyApp);
+});
+
+test("shared rate-limit storage outages fail API requests closed and appear in readiness", async () => {
+  const unavailableStore = {
+    kind: "redis",
+    shared: true,
+    increment: async () => { throw new Error("synthetic storage outage"); },
+    healthCheck: async () => ({ available: false, shared: true }),
+  };
+  const failingApp = createApp(getEnv(), { writeLog: () => {}, rateLimitStore: unavailableStore });
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/v1/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(response.status, 503);
+    const payload = await response.json();
+    assert.equal(payload.error.code, "RATE_LIMIT_STORE_UNAVAILABLE");
+    assert.doesNotMatch(JSON.stringify(payload), /synthetic storage outage|redis|secret/i);
+    const readiness = await fetch(`${baseUrl}/health/ready`);
+    assert.equal(readiness.status, 503);
+    assert.equal((await readiness.json()).data.checks.rateLimitStore, "unavailable");
+  }, failingApp);
 });
 
 test("unknown routes return a JSON 404 response with a stable code and request ID", async () => {

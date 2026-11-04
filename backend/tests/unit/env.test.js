@@ -22,7 +22,8 @@ test("validates required values and applies development defaults", () => {
   assert.equal(config.nodeEnv, "development");
   assert.equal(config.port, 3000);
   assert.deepEqual(config.corsAllowedOrigins, []);
-  assert.deepEqual(config.rateLimit, { windowMs: 900000, max: 100 });
+  assert.deepEqual({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.max }, { windowMs: 900000, max: 100 });
+  assert.equal(config.rateLimit.store, "memory");
   assert.deepEqual(config.password, { bcryptSaltRounds: 12 });
   assert.equal(config.database.url, validEnvironment.DATABASE_URL);
   assert.equal(config.jwt.accessTtl, "15m");
@@ -68,7 +69,7 @@ test("accepts exact CORS origins and rejects wildcards or paths safely", () => {
     "https://app.example.test",
     "http://localhost:5173",
   ]);
-  assert.deepEqual(config.rateLimit, { windowMs: 60000, max: 12 });
+  assert.deepEqual({ windowMs: config.rateLimit.windowMs, max: config.rateLimit.max }, { windowMs: 60000, max: 12 });
 
   for (const CORS_ALLOWED_ORIGINS of ["*", "https://app.example.test/private"]) {
     assert.throws(
@@ -87,6 +88,34 @@ test("validates API rate-limit settings", () => {
   ]) {
     expectConfigError(env);
   }
+});
+
+test("production rate limiting requires TLS Redis, ACL credentials and a hidden key secret", () => {
+  const production = {
+    ...validEnvironment,
+    NODE_ENV: "production",
+    RATE_LIMIT_STORE: "redis",
+    REDIS_URL: "rediss://acl-user:synthetic-redis-password@redis.example.test:6380/0",
+    RATE_LIMIT_KEY_SECRET: "separate-rate-limit-key-secret-0123456789",
+    MFA_ENCRYPTION_PROVIDER: "kms",
+    MFA_KMS_KEY_ID: "projects/test/keys/mfa",
+    MFA_KMS_KEY_VERSION: "1",
+  };
+  const config = validateEnv(production);
+  assert.equal(config.rateLimit.store, "redis");
+  assert.equal(Object.keys(config.rateLimit).includes("redisUrl"), false);
+  assert.equal(Object.keys(config.rateLimit).includes("keySecret"), false);
+  assert.equal(JSON.stringify(config).includes("synthetic-redis-password"), false);
+
+  for (const invalid of [
+    { ...production, RATE_LIMIT_STORE: "memory" },
+    { ...production, REDIS_URL: "redis://acl-user:synthetic-redis-password@redis.example.test:6379/0" },
+    { ...production, REDIS_URL: "rediss://redis.example.test:6380/0" },
+    { ...production, RATE_LIMIT_KEY_SECRET: undefined },
+    { ...production, MFA_ENCRYPTION_PROVIDER: "local" },
+    { ...production, MFA_KMS_KEY_ID: undefined },
+    { ...production, MFA_KMS_KEY_VERSION: undefined },
+  ]) assert.throws(() => validateEnv(invalid), EnvironmentConfigError);
 });
 
 test("validates MFA login challenge lifetime, assurance age, and auth rate limits", () => {
@@ -200,6 +229,10 @@ test("local MFA encryption key is optional, hidden, validated, and forbidden in 
   assert.equal(JSON.stringify(configured).includes(marker), false);
   assert.throws(() => validateEnv({ ...validEnvironment, MFA_LOCAL_ENCRYPTION_KEY: "not-a-key" }), /MFA_LOCAL_ENCRYPTION_KEY/);
   assert.throws(() => validateEnv({ ...validEnvironment, NODE_ENV: "production", MFA_LOCAL_ENCRYPTION_KEY: marker }), /MFA_LOCAL_ENCRYPTION_KEY/);
+  const production = validateEnv({ ...validEnvironment, NODE_ENV: "production", RATE_LIMIT_STORE: "redis", REDIS_URL: "rediss://acl-user:synthetic-redis-password@redis.example.test:6380/0", RATE_LIMIT_KEY_SECRET: "separate-rate-limit-key-secret-0123456789", MFA_ENCRYPTION_PROVIDER: "kms", MFA_KMS_KEY_ID: "projects/test/keys/mfa", MFA_KMS_KEY_VERSION: "1" });
+  assert.equal(production.mfa.encryptionProvider, "kms");
+  assert.equal(production.mfa.kmsKeyVersion, 1);
+  assert.throws(() => validateEnv({ ...validEnvironment, NODE_ENV: "production", RATE_LIMIT_STORE: "redis", REDIS_URL: "rediss://acl-user:synthetic-redis-password@redis.example.test:6380/0", RATE_LIMIT_KEY_SECRET: "separate-rate-limit-key-secret-0123456789" }), /MFA_ENCRYPTION_PROVIDER|MFA_KMS_KEY_ID/);
 });
 
 test("TOTP clock window defaults to one step and is bounded", () => {

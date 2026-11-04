@@ -22,6 +22,13 @@ export const createMfaCrypto = ({ provider } = {}) => {
   }
 
   return Object.freeze({
+    async checkAvailability() {
+      try {
+        if (typeof provider.checkAvailability === "function") await provider.checkAvailability();
+        else if (provider.kind !== "local-development") throw fail();
+        return true;
+      } catch { throw fail(); }
+    },
     async encrypt(secret, { userId, purpose = "totp" } = {}) {
       if (typeof secret !== "string" || !secret || typeof userId !== "string" || !userId) throw fail();
       try {
@@ -52,6 +59,10 @@ export const createLocalDevelopmentEncryptionProvider = ({ environment = getEnv 
   };
 
   return Object.freeze({
+    kind: "local-development",
+    async checkAvailability() {
+      try { return getKey().length === 32; } catch { throw fail(); }
+    },
     async encryptSecret(plaintext, { userId, purpose, aad }) {
       try {
         const key = Buffer.from(getKey());
@@ -72,6 +83,79 @@ export const createLocalDevelopmentEncryptionProvider = ({ environment = getEnv 
         decipher.setAuthTag(envelope.authTag);
         return Buffer.concat([decipher.update(envelope.ciphertext), decipher.final()]).toString("utf8");
       } catch { throw fail(); }
+    },
+  });
+};
+
+const ENVELOPE_MAGIC = Buffer.from("TBK1");
+const kmsAad = (aad, keyId, keyVersion) => Buffer.concat([aad, Buffer.from(`\u0000${keyId}\u0000${keyVersion}`, "utf8")]);
+
+// Provider-neutral envelope encryption. The injected KMS client must implement
+// generateDataKey({ keyId, encryptionContext }) and
+// decryptDataKey({ keyId, keyVersion, encryptedDataKey, encryptionContext }).
+// Plaintext DEKs exist only for the duration of one operation; the KEK never
+// enters this process. The database ciphertext packs the wrapped DEK alongside
+// the AES-GCM ciphertext, so no schema field is needed.
+export const createKmsEnvelopeEncryptionProvider = ({ kms, keyId, keyVersion } = {}) => {
+  if (!kms || typeof kms.generateDataKey !== "function" || typeof kms.decryptDataKey !== "function" || typeof kms.checkAvailability !== "function"
+    || typeof keyId !== "string" || !keyId || keyId.trim() !== keyId || keyId.length > 128 || !Number.isInteger(keyVersion) || keyVersion < 1) {
+    throw new TypeError("A configured KMS client and key version are required");
+  }
+
+  const encryptionContext = (purpose) => Object.freeze({ application: "trustbridge", purpose });
+  return Object.freeze({
+    kind: "kms-envelope",
+    keyId,
+    keyVersion,
+    async checkAvailability() {
+      try {
+        if (typeof kms.checkAvailability !== "function") throw fail();
+        await kms.checkAvailability({ keyId });
+        return true;
+      } catch { throw fail(); }
+    },
+    async encryptSecret(plaintext, { purpose, aad }) {
+      let dataKey;
+      try {
+        const generated = await kms.generateDataKey({ keyId, encryptionContext: encryptionContext(purpose) });
+        dataKey = generated?.plaintextKey;
+        const wrapped = generated?.encryptedDataKey;
+        if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32 || !Buffer.isBuffer(wrapped) || wrapped.length < 1 || wrapped.length > 1_048_576) throw fail();
+        const nonce = randomBytes(12);
+        const cipher = createCipheriv("aes-256-gcm", dataKey, nonce);
+        cipher.setAAD(kmsAad(aad, keyId, keyVersion));
+        const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+        const header = Buffer.alloc(8);
+        ENVELOPE_MAGIC.copy(header, 0);
+        header.writeUInt32BE(wrapped.length, 4);
+        return Object.freeze({ ciphertext: Buffer.concat([header, wrapped, encrypted]), nonce, authTag: cipher.getAuthTag(), keyId, keyVersion });
+      } catch { throw fail(); }
+      finally { dataKey?.fill(0); }
+    },
+    async decryptSecret(envelope, { purpose, aad }) {
+      let dataKey;
+      try {
+        const stored = envelope?.ciphertext;
+        if (!Buffer.isBuffer(stored) || stored.length < 9 || !stored.subarray(0, 4).equals(ENVELOPE_MAGIC)
+          || !Buffer.isBuffer(envelope.nonce) || envelope.nonce.length !== 12 || !Buffer.isBuffer(envelope.authTag) || envelope.authTag.length !== 16
+          || typeof envelope.keyId !== "string" || !Number.isInteger(envelope.keyVersion) || envelope.keyVersion < 1) throw fail();
+        const wrappedLength = stored.readUInt32BE(4);
+        if (wrappedLength < 1 || wrappedLength > 1_048_576 || stored.length <= 8 + wrappedLength) throw fail();
+        const encryptedDataKey = stored.subarray(8, 8 + wrappedLength);
+        const encryptedSecret = stored.subarray(8 + wrappedLength);
+        dataKey = await kms.decryptDataKey({
+          keyId: envelope.keyId,
+          keyVersion: envelope.keyVersion,
+          encryptedDataKey: Buffer.from(encryptedDataKey),
+          encryptionContext: encryptionContext(purpose),
+        });
+        if (!Buffer.isBuffer(dataKey) || dataKey.length !== 32) throw fail();
+        const decipher = createDecipheriv("aes-256-gcm", dataKey, envelope.nonce);
+        decipher.setAAD(kmsAad(aad, envelope.keyId, envelope.keyVersion));
+        decipher.setAuthTag(envelope.authTag);
+        return Buffer.concat([decipher.update(encryptedSecret), decipher.final()]).toString("utf8");
+      } catch { throw fail(); }
+      finally { dataKey?.fill(0); }
     },
   });
 };

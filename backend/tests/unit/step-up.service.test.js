@@ -4,7 +4,7 @@ import { createMfaService, MfaServiceError } from "../../src/services/mfa.servic
 import { createStepUpPurposeRegistry } from "../../src/services/step-up-purpose.registry.js";
 
 const now = new Date("2026-01-01T00:00:00.000Z");
-const auth = Object.freeze({ userId: "11111111-1111-4111-8111-111111111111", role: "USER", authVersion: 2, sessionId: "22222222-2222-4222-8222-222222222222", mfaEnabled: true, mfaVerifiedAt: new Date(now.getTime() - 60_000) });
+const auth = Object.freeze({ userId: "11111111-1111-4111-8111-111111111111", role: "USER", authVersion: 2, sessionId: "22222222-2222-4222-8222-222222222222", mfaEnabled: true, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date(now.getTime() - 60_000) });
 const registry = createStepUpPurposeRegistry({
   TEST_SENSITIVE_ACTION: { resourceType: "TRANSACTION", resourceRequired: true, allowedRoles: ["USER"], maxAgeSeconds: 120, additionalAuthorizationRequired: true, oneTime: true },
 });

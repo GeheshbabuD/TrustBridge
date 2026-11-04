@@ -9,6 +9,78 @@ const purposeDefinitions = {
     additionalAuthorizationRequired: true,
     oneTime: true,
   }),
+  LEGACY_ADMIN_MFA_ENROLL_AUTHORIZE: Object.freeze({
+    resourceType: "ACCOUNT_RECOVERY_REQUEST",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  ADMIN_RECOVERY_IDENTITY_VERIFY: Object.freeze({
+    resourceType: "ACCOUNT_RECOVERY_REQUEST",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  ADMIN_RECOVERY_APPROVAL: Object.freeze({
+    resourceType: "ACCOUNT_RECOVERY_REQUEST",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  MFA_DISABLE: Object.freeze({
+    resourceType: "USER",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["USER"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  USER_ACCOUNT_DEACTIVATE: Object.freeze({
+    resourceType: "USER",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["USER"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  ADMIN_USER_STATUS_UPDATE: Object.freeze({
+    resourceType: "USER",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  USER_PASSWORD_CHANGE: Object.freeze({
+    resourceType: "USER",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["USER", "ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  ESCROW_RELEASE: Object.freeze({
+    resourceType: "TRANSACTION",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["USER"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  ESCROW_REFUND: Object.freeze({
+    resourceType: "TRANSACTION",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
 };
 
 export const STEP_UP_PURPOSES = Object.freeze(purposeDefinitions);
@@ -31,7 +103,6 @@ export const createStepUpPurposeRegistry = (entries) => {
       || typeof definition.resourceType !== "string" || !/^[A-Z][A-Z0-9_]{1,63}$/.test(definition.resourceType)
       || typeof definition.resourceRequired !== "boolean"
       || typeof definition.additionalAuthorizationRequired !== "boolean"
-      || typeof definition.oneTime !== "boolean"
       || typeof definition.oneTime !== "boolean") {
       throw new TypeError("Invalid step-up purpose definition");
     }

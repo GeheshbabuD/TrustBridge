@@ -1,5 +1,7 @@
 # TrustBridge 2.0 Backend Blueprint
 
+Tracker status updated 2026-11-04; implementation evidence and migration state below supersede older dated notes.
+
 Authoritative evidence-based tracker; updated 2026-11-03. Source, migrations and tests override recorded status. [ ] NOT STARTED; [/] IN PROGRESS; [x] COMPLETED; [!] BLOCKED; [-] DEFERRED. Exclude deferred tasks from active denominator. Completion = completed active / total active. Phase 0 checkmarks certify planning/audit deliverables only; they do not complete or imply implementation tasks. Each task below has priority, dependencies, acceptance and tests; target paths are not a request for empty placeholders. Dependencies list task IDs; named decision gates are explicitly labeled as gates.
 
 ## Repository audit
@@ -48,12 +50,16 @@ Client → Express /api/v1 → security/auth/role/validation middleware → rout
 - [ ] TB-BE-034G Controlled legacy ADMIN MFA onboarding; P0; deps 034C,034D,033; provide a tightly scoped, one-time enrollment path for existing ADMIN accounts denied normal login without active MFA; require independent provisioning control, short expiry, single use, audit, and no normal access/refresh session until TOTP enrollment is confirmed.
 
 ## Phase 4 — Users
+  - [x] TB-BE-036 User and Profile Management; P1; deps 033,034; self profile/preferences, password change, user deactivation, admin status management, strict field allowlists, session/authVersion invalidation and audit; focused service/HTTP/schema tests. Final code and isolated PostgreSQL review passed, including rollback and concurrent account-operation tests. `20261104120000_user_profile_preferences` is applied and verified on `trustbridge_test`; it remains a deployment prerequisite for the development database and requires its separately reviewed migration sequence before those routes run there.
 - [ ] TB-BE-040 Profile read/update; P1; deps 033,021,025; owner-only and field allowlist; integration/cross-user tests.
 - [ ] TB-BE-041 Account/admin controls; P1; deps 040,023,034; least privilege, reason and audit; role/audit tests.
 
+Infrastructure pause effective 2026-11-04: production KMS provider verification, production Redis deployment, independent identity-verification provider, and secure recovery-delivery provider are **PAUSED — INFRASTRUCTURE DECISION REQUIRED** until a hosting/platform decision is made. This supersedes earlier “pending provider” notes; existing fail-closed behavior and implementation/tests remain intact. Feature work may proceed without these deployment selections.
+
 ## Phase 5 — Transactions
-- [ ] TB-BE-050 State machine; P0; deps 021,022; enforce explicit graph: CREATED→ACCEPTED or CANCELLED/REJECTED; ACCEPTED→AWAITING_PAYMENT; AWAITING_PAYMENT→FUNDED or CANCELLED; FUNDED→IN_PROGRESS, DISPUTED or REFUND_PENDING; IN_PROGRESS→DELIVERED or DISPUTED; DELIVERED→RELEASE_PENDING or DISPUTED; DISPUTED→IN_PROGRESS, REFUND_PENDING or RELEASE_PENDING only by authorized resolution; RELEASE_PENDING→COMPLETED only after verified provider payout; REFUND_PENDING→REFUNDED only after verified refund; terminal states have no outgoing transitions. Payment failure remains a payment-attempt state, not a transaction state. Reject arbitrary client status; persist actor/reason/from/to history. Add REJECTED state for declined invitations. Tests cover every edge, forbidden edge, concurrency and evidence of settlement.
-- [ ] TB-BE-051 Create terms/invite; P0; deps 050,033,040; authenticated parties and valid money/consent; integration/ownership tests.
+- [x] TB-BE-037 Transaction lifecycle and participants; authenticated USER creation, buyer/seller participant assignment, participant-only list/detail/history, seller accept/reject and buyer cancel/payment-pending transitions, scoped idempotency, atomic initial/history/audit records, row-lock/version concurrency. Focused, HTTP, and isolated PostgreSQL tests passed; no schema change. Payment/dispute/settlement transitions remain for TB-BE-050–053.
+- [/] TB-BE-050 State machine; P0; deps 021,022; ADR-010 accepted and recorded. Guarded service preserves TB-BE-037 participant transitions; `AWAITING_PAYMENT→CANCELLED` is allowed only with no PaymentAttempt row and otherwise fails closed because verified provider outcome support is absent. Funding, progress, delivery, dispute, release, refund and settlement edges remain denied until their authoritative modules exist. Focused tests 15/15; isolated PostgreSQL tests 9/9; full default suite 243 passed, 0 failed, 4 opt-in skips; no schema change. See `docs/TRANSACTION_STATE_MACHINE_DESIGN.md`. Full lifecycle remains IN PROGRESS.
+- [x] TB-BE-051 Transaction terms and seller invitation; authenticated buyer/seller ownership, strict structured terms, immutable bilateral version decisions, token-hash-only single-use seller invitation, row-lock serialization and acceptance gate. Additive migration `20261104130000_transaction_terms_invitations` applied and schema-diff verified on isolated `trustbridge_test` only; focused 22/22 and PostgreSQL 11/11 passed. Full suite and secure-delivery limitation are recorded in `docs/PROGRESS_REPORT.md`.
 - [ ] TB-BE-052 Accept/reject/progress; P0; deps 051; authorized counterparty, atomic state/audit; concurrency/auth tests.
 - [ ] TB-BE-053 Delivery/confirmation/cancel/history; P1; deps 052; valid transitions and paginated owner history; lifecycle tests.
 
@@ -63,7 +69,9 @@ Client → Express /api/v1 → security/auth/role/validation middleware → rout
 - [ ] TB-BE-062 Release/refund authorization; P0; deps 060,061; policy/role/state/idempotency/audit; only buyer confirmation or reviewed dispute resolution can initiate per policy; MVP supports full remaining balance only; this task records authorization, not provider payout/refund; duplicate/concurrency tests; AI cannot authorize.
 
 ## Phase 7 — Payments
-- [ ] TB-BE-070 Provider abstraction/eligibility; P0; deps 011,022; provider-neutral mock, evaluate Razorpay eligibility; adapter contract tests.
+- [x] TB-BE-038 Payment integration architecture and provider-neutral payment core; Phase 1 design and Phase 2 APIs, idempotency, outbox dispatch, verified webhooks, reconciliation and transaction-first cancellation guards implemented; no provider selected; no production money operations. Focused tests 27/27, isolated PostgreSQL tests 6/6, full suite 265 passed/0 failed/5 skipped. Production provider selection and deployment remain prerequisite to enabling payments.
+
+- [x] TB-BE-070 Razorpay adapter foundation; P0; deps 011,022,038; provider-neutral core extended with server Orders, callback verification, raw-byte webhook, reconciliation and guarded refund/Route interfaces. Mock tests pass; live payments remain disabled and Route/refund financial approvals remain gated. Evidence: DEVELOPMENT_LOG 2026-11-04.
 - [ ] TB-BE-071 Order/verification; P0; deps 070,051; server order, verified signature, client success untrusted; mocked/invalid signature tests.
 - [ ] TB-BE-072 Signed webhooks; P0; deps 071,013,025,026; raw-body signature/replay/idempotency/durable inbox processing; tampered/duplicate/out-of-order tests. Acknowledge only after durable acceptance; process asynchronously/retry safely.
 - [ ] TB-BE-073 Provider refund execution; P0; deps 062,072; MVP sends only an authorized full remaining-balance refund; track requested/confirmed/failed and only transition to REFUNDED after verified provider outcome; partial refunds require separately approved allocation design; mocked provider only, no real money.
@@ -127,3 +135,12 @@ Confirm app/schema root and inspect lockfile before package changes; confirm fro
 10. TB-BE-090–094 and TB-BE-100–104: AI with human review and blockchain prototype/key operations; these remain advisory/test-only without approvals.
 11. TB-BE-110–112, then TB-BE-120–123 and TB-BE-130–132. Keep integration/security tests close to implementation.
 12. TB-BE-105–106: independent contract review and approved testnet deployment, only after prerequisite security tests and external gates. Finish with TB-BE-133; release is gated on all P0 tasks plus explicit legal/security/provider/operations reviews.
+
+
+
+
+## TB-BE-039 status (2026-11-04)
+
+- [/] TB-BE-039 Escrow, double-entry ledger, release/refund authorization; consolidated work across TB-BE-060/061/062. Foundation and isolated PostgreSQL verification exist; provider payout/refund execution/reconciliation and remaining test gates are incomplete. Do not mark complete or enable live money movement.
+
+Migration follow-up: `20261104131000_escrow_execution_leases` adds a non-negative `attempt_count`, due-time and lease fields/index so internal executor workers can make atomic bounded claims. It is additive and applied only to verified `trustbridge_test`; development/production remain untouched. Verification: `npm.cmd test` **285 passed, 0 failed, 6 skipped**; focused **28/28**; two-client PostgreSQL escrow suite **1/1**; Prisma migrate status reports schema up to date. TB-BE-039 remains IN PROGRESS pending provider execution/reconciliation wiring and additional API/finalization tests.

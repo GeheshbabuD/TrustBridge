@@ -107,11 +107,13 @@ export const createAuthService = ({
     let verified;
     try { verified = await getMfaService().verifyLoginChallenge({ challengeToken, code }); }
     catch { throw new AuthServiceError(401, "INVALID_MFA_CHALLENGE", "Authentication could not be completed"); }
-    if (!verified) throw new AuthServiceError(401, "INVALID_MFA_CHALLENGE", "Authentication could not be completed");
+    if (!verified || !["TOTP_VERIFIED", "RECOVERY_CODE_VERIFIED"].includes(verified.assuranceLevel)
+      || ((verified.assuranceLevel === "TOTP_VERIFIED") !== (verified.mfaVerifiedAt instanceof Date))) throw new AuthServiceError(401, "INVALID_MFA_CHALLENGE", "Authentication could not be completed");
     try {
       return await sessionService.issueForUser(verified.userId, {
         expectedAuthVersion: verified.authVersion,
         mfaVerifiedAt: verified.mfaVerifiedAt,
+        assuranceLevel: verified.assuranceLevel,
       });
     } catch {
       throw new AuthServiceError(401, "INVALID_MFA_CHALLENGE", "Authentication could not be completed");

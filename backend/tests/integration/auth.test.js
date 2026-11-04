@@ -188,6 +188,13 @@ test("MFA login returns a limited challenge without tokens, then challenge verif
     assert.deepEqual(verification, { challengeToken, code: "123456" });
     assert.deepEqual(verified.data, { accessToken: "mfa-access", refreshToken: "mfa-refresh", tokenType: "Bearer" });
     assert.equal(JSON.stringify(verified).includes(challengeToken), false);
+
+    const recoveryResponse = await fetch(`${baseUrl}/api/v1/auth/mfa/challenge/verify`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ challengeToken, code: "a".repeat(32) }),
+    });
+    assert.equal(recoveryResponse.status, 200);
+    assert.deepEqual(verification, { challengeToken, code: "a".repeat(32) });
   });
 });
 

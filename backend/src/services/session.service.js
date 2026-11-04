@@ -3,7 +3,7 @@ import { getPrismaClient } from "../config/db.js";
 import { getEnv } from "../config/env.js";
 import { AuthServiceError } from "../utils/ApiError.js";
 import { createRefreshToken, hashRefreshToken } from "../utils/refresh-token.js";
-import { signAccessToken } from "../utils/jwt.js";
+import { MFA_ASSURANCE_LEVELS, signAccessToken } from "../utils/jwt.js";
 
 const invalidRefresh = () => new AuthServiceError(401, "INVALID_REFRESH_TOKEN", "Refresh token is invalid or expired");
 const parseDuration = (value) => {
@@ -26,7 +26,7 @@ export const createSessionService = ({
   const sign = signAccess ?? ((id, claims = {}) => signAccessToken(id, { environment: config(), ...claims }));
   const expiry = () => new Date(now().getTime() + parseDuration(config().jwt.refreshTtl));
   const issueAccess = (id, sessionClaims) => sign(id, sessionClaims);
-  const issueForUser = async (userId, { mfaVerifiedAt = null, expectedAuthVersion } = {}) => {
+  const issueForUser = async (userId, { mfaVerifiedAt = null, assuranceLevel, expectedAuthVersion } = {}) => {
     const client = await getClient();
     const user = await client.user.findUnique({ where: { id: userId }, select: {
       id: true, role: true, status: true, authVersion: true,
@@ -35,7 +35,13 @@ export const createSessionService = ({
     const mfaEnabled = user?.mfa?.enrollmentStatus === "ENABLED" && Boolean(user.mfa.enabledAt);
     const needsMfa = user?.role === "ADMIN" || mfaEnabled;
     const validMfaTimestamp = mfaVerifiedAt instanceof Date && Number.isFinite(mfaVerifiedAt.getTime()) && mfaVerifiedAt <= now();
-    if (!user || user.status !== "ACTIVE" || !Number.isSafeInteger(user.authVersion) || (expectedAuthVersion !== undefined && user.authVersion !== expectedAuthVersion) || (needsMfa && (!mfaEnabled || !validMfaTimestamp)) || (mfaVerifiedAt && (!mfaEnabled || !validMfaTimestamp))) {
+    const resolvedAssurance = assuranceLevel ?? (validMfaTimestamp ? "TOTP_VERIFIED" : "PASSWORD_ONLY");
+    const assuranceValid = MFA_ASSURANCE_LEVELS.includes(resolvedAssurance)
+      && ((resolvedAssurance === "TOTP_VERIFIED") === Boolean(validMfaTimestamp));
+    const eligibleMfaAssurance = resolvedAssurance === "TOTP_VERIFIED" || resolvedAssurance === "RECOVERY_CODE_VERIFIED";
+    if (!user || user.status !== "ACTIVE" || !Number.isSafeInteger(user.authVersion) || (expectedAuthVersion !== undefined && user.authVersion !== expectedAuthVersion) || !assuranceValid
+      || (mfaVerifiedAt !== null && !validMfaTimestamp)
+      || (needsMfa && (!mfaEnabled || !eligibleMfaAssurance)) || (eligibleMfaAssurance && !mfaEnabled)) {
       throw new AuthServiceError(401, "INVALID_CREDENTIALS", "Email or password is incorrect");
     }
     const token = makeToken();
@@ -44,10 +50,11 @@ export const createSessionService = ({
     const session = await client.refreshToken.create({ data: {
       userId, tokenHash, familyId: makeId(), authVersion: user.authVersion,
       mfaVerifiedAt: validMfaTimestamp ? mfaVerifiedAt : null,
+      assuranceLevel: resolvedAssurance,
       expiresAt: expiry(),
-    }, select: { id: true } });
+    }, select: { id: true, createdAt: true } });
     return {
-      accessToken: issueAccess(userId, { sessionId: session.id, authVersion: user.authVersion, mfaVerifiedAt: validMfaTimestamp ? mfaVerifiedAt : undefined }),
+      accessToken: issueAccess(userId, { sessionId: session.id, authVersion: user.authVersion, mfaVerifiedAt: validMfaTimestamp ? mfaVerifiedAt : undefined, assuranceLevel: resolvedAssurance }),
       refreshToken: token,
       tokenType: "Bearer",
     };
@@ -63,7 +70,7 @@ export const createSessionService = ({
     const result = await client.$transaction(async (tx) => {
       const current = await tx.refreshToken.findUnique({
         where: { tokenHash },
-        select: { id: true, userId: true, familyId: true, authVersion: true, mfaVerifiedAt: true, expiresAt: true, revokedAt: true, rotatedTo: { select: { id: true } }, user: { select: { status: true, role: true, authVersion: true, mfa: { select: { enrollmentStatus: true, enabledAt: true } } } } },
+        select: { id: true, userId: true, familyId: true, authVersion: true, mfaVerifiedAt: true, assuranceLevel: true, createdAt: true, expiresAt: true, revokedAt: true, rotatedTo: { select: { id: true } }, user: { select: { status: true, role: true, authVersion: true, mfa: { select: { enrollmentStatus: true, enabledAt: true } } } } },
       });
       if (!current) return { invalid: true };
       const detectReuse = async () => {
@@ -80,7 +87,12 @@ export const createSessionService = ({
       if (current.revokedAt) return current.rotatedTo ? detectReuse() : { invalid: true };
       const mfaEnabled = current.user.mfa?.enrollmentStatus === "ENABLED" && Boolean(current.user.mfa.enabledAt);
       const needsMfa = current.user.role === "ADMIN" || mfaEnabled;
-      if (current.expiresAt <= now() || current.user.status !== "ACTIVE" || current.authVersion !== current.user.authVersion || (needsMfa && (!mfaEnabled || !current.mfaVerifiedAt)) || (current.mfaVerifiedAt && !mfaEnabled)) return { invalid: true };
+      const assuranceLevel = current.assuranceLevel;
+      const validAssurance = MFA_ASSURANCE_LEVELS.includes(assuranceLevel)
+        && ((assuranceLevel === "TOTP_VERIFIED") === Boolean(current.mfaVerifiedAt));
+      const hasMfaAssurance = assuranceLevel === "TOTP_VERIFIED" || assuranceLevel === "RECOVERY_CODE_VERIFIED";
+      if (current.expiresAt <= now() || current.user.status !== "ACTIVE" || current.authVersion !== current.user.authVersion || !validAssurance
+        || (needsMfa && (!mfaEnabled || !hasMfaAssurance)) || (hasMfaAssurance && (!mfaEnabled || !(current.createdAt instanceof Date) || current.createdAt < current.user.mfa.enabledAt))) return { invalid: true };
 
       const claimed = await tx.refreshToken.updateMany({
         where: { id: current.id, revokedAt: null, expiresAt: { gt: now() } },
@@ -96,13 +108,14 @@ export const createSessionService = ({
         familyId: current.familyId,
         authVersion: current.authVersion,
         mfaVerifiedAt: current.mfaVerifiedAt,
+        assuranceLevel,
         rotatedFromId: current.id,
         expiresAt: expiry(),
       }, select: { id: true } });
-      return { userId: current.userId, replacementId: replacement.id, authVersion: current.authVersion, mfaVerifiedAt: current.mfaVerifiedAt };
+      return { userId: current.userId, replacementId: replacement.id, authVersion: current.authVersion, mfaVerifiedAt: current.mfaVerifiedAt, assuranceLevel };
     });
     if (result.invalid) throw invalidRefresh();
-    return { accessToken: issueAccess(result.userId, { sessionId: result.replacementId, authVersion: result.authVersion, mfaVerifiedAt: result.mfaVerifiedAt ?? undefined }), refreshToken: nextToken, tokenType: "Bearer" };
+    return { accessToken: issueAccess(result.userId, { sessionId: result.replacementId, authVersion: result.authVersion, mfaVerifiedAt: result.mfaVerifiedAt ?? undefined, assuranceLevel: result.assuranceLevel }), refreshToken: nextToken, tokenType: "Bearer" };
   };
 
   const logout = async (token) => {

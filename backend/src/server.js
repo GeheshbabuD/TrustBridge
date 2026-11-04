@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import app from "./app.js";
 import { disconnectDatabase } from "./config/db.js";
 import { getEnv } from "./config/env.js";
+import { closeRateLimitStore } from "./services/rate-limit-store.service.js";
 
 export const startServer = (
   port = getEnv().port,
@@ -29,6 +30,12 @@ export const startServer = (
 
       try {
         await disconnectDatabaseResource();
+      } catch {
+        shutdownFailed = true;
+      }
+
+      try {
+        await closeRateLimitStore();
       } catch {
         shutdownFailed = true;
       }

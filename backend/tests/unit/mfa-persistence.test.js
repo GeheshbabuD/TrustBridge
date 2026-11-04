@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
 import { createMfaPersistenceService, MfaPersistenceError } from "../../src/services/mfa-persistence.service.js";
 
@@ -8,7 +9,7 @@ const crypto = { async encrypt() { return envelope; }, async decrypt() { return 
 const activeUser = { status: "ACTIVE", role: "USER", authVersion: 0 };
 const makeService = (client, extra = {}) => createMfaPersistenceService({ getClient: async () => client, encryption: crypto, now: () => new Date("2026-01-01T00:00:00Z"), makeId: () => "22222222-2222-4222-8222-222222222222", ...extra });
 const transactionClient = (handlers) => ({
-  $transaction: async (fn) => fn({ ...handlers }),
+  $transaction: async (fn) => fn({ $queryRaw: async () => [], ...handlers }),
   ...handlers,
 });
 
@@ -53,6 +54,7 @@ test("activation and first recovery-code batch commit through one persistence tr
     $transaction: async (fn) => {
       transactionCalls += 1;
       return fn({
+        $queryRaw: async () => [],
         user: { findUnique: async () => activeUser },
         userMfa: {
           findUnique: async () => ({ id: "mfa", enrollmentStatus: "PENDING", pendingCiphertext: envelope.ciphertext, pendingNonce: envelope.nonce, pendingAuthTag: envelope.authTag, pendingKeyId: envelope.keyId, pendingKeyVersion: envelope.keyVersion, pendingExpiresAt: new Date("2026-01-01T00:10:00Z") }),
@@ -123,6 +125,7 @@ test("step-up verification atomically claims one TOTP step and consumes one sess
   let consumed = false;
   const client = {
     $transaction: async (fn) => fn({
+      $queryRaw: async () => [],
       mfaChallenge: {
         findUnique: async () => ({ ...challenge, attemptCount: attempts, consumedAt: consumed ? nowDate : null, verifiedAt: consumed ? nowDate : null }),
         updateMany: async ({ where, data }) => {
@@ -196,6 +199,7 @@ test("concurrent enrollment verification issues exactly one recovery batch", asy
   let batches = 0;
   const client = {
     $transaction: async (fn) => fn({
+      $queryRaw: async () => [],
       user: { findUnique: async () => activeUser },
       userMfa: {
         findUnique: async () => ({ id: "mfa", enrollmentStatus: "PENDING", pendingCiphertext: envelope.ciphertext, pendingNonce: envelope.nonce, pendingAuthTag: envelope.authTag, pendingKeyId: envelope.keyId, pendingKeyVersion: envelope.keyVersion, pendingExpiresAt: new Date("2026-01-01T00:10:00Z") }),
@@ -225,7 +229,8 @@ test("recovery batch persists only hashes, invalidates old codes, and consumes o
   let invalidated = 0;
   const handlers = {
     user: { findUnique: async () => activeUser },
-    userMfa: { findUnique: async () => ({ enabledAt: new Date() }) },
+    userMfa: { findUnique: async () => ({ enrollmentStatus: "ENABLED", enabledAt: new Date("2025-12-01") }) },
+    refreshToken: { findUnique: async () => ({ id: "session-1", userId, authVersion: 0, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date("2025-12-15"), createdAt: new Date("2025-12-15"), revokedAt: null, expiresAt: new Date("2027-01-01") }) },
     mfaRecoveryCode: {
       updateMany: async (args) => { if (args.data.invalidatedAt) invalidated += 1; else if (!consumed && args.where.codeHash === rows[0].codeHash) { consumed = true; return { count: 1 }; } return { count: 0 }; },
       createMany: async ({ data }) => { rows = data; return { count: data.length }; },
@@ -233,7 +238,7 @@ test("recovery batch persists only hashes, invalidates old codes, and consumes o
     auditLog: { create: async () => ({ id: "audit" }) },
   };
   const service = makeService(transactionClient(handlers), { makeRecoveryCode: (() => { let n = 0; return () => `RECOVERYCODE${String(++n).padStart(20, "0")}`; })() });
-  const batch = await service.createRecoveryCodeBatch({ userId });
+  const batch = await service.createRecoveryCodeBatch({ userId, sessionId: "session-1", authVersion: 0, mfaVerifiedAt: new Date("2025-12-15") });
   assert.equal(batch.codes.length, 10);
   assert.equal(rows.length, 10);
   assert.equal(invalidated, 1);
@@ -252,8 +257,10 @@ test("failed recovery batch transaction rolls back invalidation and inserts", as
     $transaction: async (fn) => {
       const snapshot = structuredClone(state);
       try { return await fn({
+        $queryRaw: async () => [],
         user: { findUnique: async () => activeUser },
-        userMfa: { findUnique: async () => ({ enabledAt: new Date() }) },
+        userMfa: { findUnique: async () => ({ enrollmentStatus: "ENABLED", enabledAt: new Date("2025-12-01") }) },
+        refreshToken: { findUnique: async () => ({ id: "session-1", userId, authVersion: 0, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date("2025-12-15"), createdAt: new Date("2025-12-15"), revokedAt: null, expiresAt: new Date("2027-01-01") }) },
         mfaRecoveryCode: {
           updateMany: async () => { state.existingInvalidated = true; return { count: 1 }; },
           createMany: async ({ data }) => { state.rows.push(...data); return { count: data.length }; },
@@ -263,8 +270,39 @@ test("failed recovery batch transaction rolls back invalidation and inserts", as
     },
   };
   const service = makeService(client);
-  await assert.rejects(service.createRecoveryCodeBatch({ userId }), MfaPersistenceError);
+  await assert.rejects(service.createRecoveryCodeBatch({ userId, sessionId: "session-1", authVersion: 0, mfaVerifiedAt: new Date("2025-12-15") }), MfaPersistenceError);
   assert.deepEqual(state, { existingInvalidated: false, rows: [] });
+});
+
+test("MFA disablement clears enrollment, invalidates codes, revokes sessions and advances authVersion", async () => {
+  const mfa = { id: "mfa-1", enrollmentStatus: "ENABLED", enabledAt: new Date("2025-12-01") };
+  const writes = [];
+  const client = transactionClient({
+    user: { findUnique: async () => ({ role: "USER", status: "ACTIVE", authVersion: 4 }), updateMany: async (args) => { writes.push(["user", args]); return { count: 1 }; } },
+    userMfa: { findUnique: async () => mfa, updateMany: async (args) => { writes.push(["mfa", args]); return { count: 1 }; } },
+    refreshToken: { findUnique: async () => ({ id: "session-1", userId, authVersion: 4, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date(), createdAt: new Date("2025-12-15"), revokedAt: null, expiresAt: new Date("2027-01-01") }), updateMany: async (args) => { writes.push(["sessions", args]); return { count: 1 }; } },
+    mfaRecoveryCode: { updateMany: async (args) => { writes.push(["codes", args]); return { count: 2 }; } },
+    auditLog: { create: async () => ({ id: "audit" }) },
+  });
+  const service = makeService(client);
+  assert.deepEqual(await service.disableMfa({ userId, sessionId: "session-1", authVersion: 4 }), { disabled: true });
+  assert.equal(writes.find(([kind]) => kind === "mfa")[1].data.enrollmentStatus, "DISABLED");
+  assert.equal(writes.find(([kind]) => kind === "mfa")[1].data.secretCiphertext, null);
+  assert.equal(writes.find(([kind]) => kind === "sessions")[1].data.revocationReason, "mfa_disabled");
+  assert.deepEqual(writes.find(([kind]) => kind === "user")[1].data.authVersion, { increment: 1 });
+  assert.equal(writes.find(([kind]) => kind === "codes")[1].data.invalidatedAt instanceof Date, true);
+});
+
+test("MFA disablement fails closed for ADMIN accounts and stale/non-TOTP sessions", async () => {
+  const base = {
+    user: { findUnique: async () => ({ role: "ADMIN", status: "ACTIVE", authVersion: 4 }), updateMany: async () => assert.fail("must not update user") },
+    userMfa: { findUnique: async () => ({ id: "mfa", enrollmentStatus: "ENABLED", enabledAt: new Date("2025-12-01") }), updateMany: async () => assert.fail("must not disable MFA") },
+    refreshToken: { findUnique: async () => ({ userId, authVersion: 4, assuranceLevel: "TOTP_VERIFIED", mfaVerifiedAt: new Date(), createdAt: new Date("2025-12-15"), revokedAt: null, expiresAt: new Date("2027-01-01") }) },
+  };
+  await assert.rejects(makeService(transactionClient(base)).disableMfa({ userId, sessionId: "session-1", authVersion: 4 }), MfaPersistenceError);
+  base.user.findUnique = async () => ({ role: "USER", status: "ACTIVE", authVersion: 4 });
+  base.refreshToken.findUnique = async () => ({ userId, authVersion: 4, assuranceLevel: "RECOVERY_CODE_VERIFIED", mfaVerifiedAt: null, createdAt: new Date("2025-12-15"), revokedAt: null, expiresAt: new Date("2027-01-01") });
+  await assert.rejects(makeService(transactionClient(base)).disableMfa({ userId, sessionId: "session-1", authVersion: 4 }), MfaPersistenceError);
 });
 
 test("challenge state is hashed, bounded, and consumed conditionally", async () => {
@@ -341,6 +379,26 @@ test("login challenge atomically consumes one challenge and one TOTP step, with 
   assert.equal(state.attemptCount, 1);
 });
 
+test("login recovery code is consumed atomically and returns recovery assurance without TOTP evidence", async () => {
+  let challengeConsumed = null;
+  let codeConsumed = false;
+  const code = "A".repeat(32);
+  const challenge = { id: "recovery-login-challenge", purpose: "LOGIN", authVersion: 3, attemptCount: 0, expiresAt: new Date("2026-01-01T00:05:00Z"), consumedAt: null,
+    user: { id: userId, role: "USER", status: "ACTIVE", authVersion: 3, mfa: { id: "mfa", enrollmentStatus: "ENABLED", enabledAt: new Date("2025-12-01"), secretCiphertext: envelope.ciphertext, secretNonce: envelope.nonce, secretAuthTag: envelope.authTag, secretKeyId: envelope.keyId, secretKeyVersion: envelope.keyVersion, lastAcceptedTimeStep: 1n } } };
+  const client = transactionClient({
+    mfaChallenge: { findUnique: async () => ({ ...challenge, consumedAt: challengeConsumed }), updateMany: async ({ data }) => { challengeConsumed = data.consumedAt; return { count: 1 }; } },
+    mfaRecoveryCode: { updateMany: async ({ where, data }) => { assert.equal(where.codeHash, createHash("sha256").update(code).digest("hex")); if (codeConsumed) return { count: 0 }; codeConsumed = Boolean(data.consumedAt); return { count: 1 }; } },
+    auditLog: { create: async () => ({ id: "audit" }) },
+  });
+  const service = makeService(client);
+  const result = await service.completeLoginChallenge({ token: "opaque-recovery-challenge", code });
+  assert.equal(result.assuranceLevel, "RECOVERY_CODE_VERIFIED");
+  assert.equal(result.mfaVerifiedAt, null);
+  assert.equal(codeConsumed, true);
+  assert.ok(challengeConsumed instanceof Date);
+  assert.equal(await service.completeLoginChallenge({ token: "opaque-recovery-challenge", code }), null);
+});
+
 test("failed, expired, consumed, wrong-purpose and exhausted login challenges cannot issue a session", async () => {
   for (const overrides of [
     { expiresAt: new Date("2025-12-31T23:59:59Z") },
@@ -372,9 +430,10 @@ test("recovery requires external identity verification, two distinct active admi
   const approvals = [];
   const client = {
     $transaction: async (fn) => fn({
-      user: { findUnique: async ({ where }) => where.id === "admin-1" || where.id === "admin-2" ? { id: where.id, role: "ADMIN", status: "ACTIVE" } : activeUser },
+      $queryRaw: async () => [],
+      user: { findUnique: async ({ where }) => where.id === "admin-1" || where.id === "admin-2" ? { id: where.id, role: "ADMIN", status: "ACTIVE", mfa: { enrollmentStatus: "ENABLED", enabledAt: new Date() } } : activeUser },
       accountRecoveryRequest: { findUnique: async () => request, updateMany: async ({ data }) => { request.status = data.status; request.version++; return { count: 1 }; } },
-      recoveryApproval: { create: async ({ data }) => { approvals.push(data); return { id: `a${approvals.length}` }; }, count: async () => approvals.filter((a) => a.decision === "APPROVE").length },
+      recoveryApproval: { create: async ({ data }) => { approvals.push(data); return { id: `a${approvals.length}` }; }, findMany: async () => approvals.map((a, i) => ({ approver: { id: a.approverId, role: "ADMIN", status: "ACTIVE", mfa: { enrollmentStatus: "ENABLED", enabledAt: new Date() } } })) },
       auditLog: { create: async () => ({ id: "audit" }) },
     }),
   };
@@ -386,4 +445,10 @@ test("recovery requires external identity verification, two distinct active admi
   request.status = "PENDING";
   assert.deepEqual(await service.recordRecoveryApproval({ requestId: "r", approverId: "admin-2", decision: "APPROVE" }), { status: "APPROVED" });
   assert.equal(approvals.length, 2);
+});
+
+test("legacy ADMIN enrollment authorization fails closed without out-of-band delivery", async () => {
+  const service = makeService({});
+  await assert.rejects(service.issueLegacyAdminEnrollmentAuthorization({ requestId: "request-1", issuedByUserId: "admin-1" }),
+    (error) => error instanceof MfaPersistenceError && error.code === "MFA_ENROLLMENT_DELIVERY_UNAVAILABLE");
 });
