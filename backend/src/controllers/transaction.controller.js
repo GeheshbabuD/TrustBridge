@@ -1,10 +1,10 @@
 import { ApiError } from "../utils/ApiError.js";
-import { idempotencyKeySchema, transactionCreateSchema, transactionHistoryQuerySchema, transactionInvitationCreateSchema, transactionInvitationResponseSchema, transactionListQuerySchema, transactionTermsDecisionSchema, transactionTermsProposalSchema, transactionTransitionSchema } from "../validators/transaction.validator.js";
+import { deliveryDecisionSchema, deliveryStartSchema, deliverySubmitSchema, idempotencyKeySchema, transactionCreateSchema, transactionHistoryQuerySchema, transactionInvitationCreateSchema, transactionInvitationResponseSchema, transactionListQuerySchema, transactionTermsDecisionSchema, transactionTermsProposalSchema, transactionTransitionSchema } from "../validators/transaction.validator.js";
 
 const validationError = () => new ApiError(400, "VALIDATION_ERROR", "Request validation failed");
 const forward = (error, next) => next(error);
 
-export const createTransactionController = ({ transactionService }) => ({
+export const createTransactionController = ({ transactionService, deliveryService }) => ({
   create: async (request, response, next) => {
     const input = transactionCreateSchema.safeParse(request.body);
     const key = idempotencyKeySchema.safeParse(request.get("idempotency-key"));
@@ -67,6 +67,39 @@ export const createTransactionController = ({ transactionService }) => ({
     const input = transactionTransitionSchema.safeParse(request.body);
     if (!input.success) return next(validationError());
     try { return response.status(200).json({ success: true, message: "Transaction status updated", data: { transaction: await transactionService.transition({ auth: request.auth, transactionId: request.params.transactionId, ...input.data, requestId: request.requestId }) } }); }
+    catch (error) { return forward(error, next); }
+  },
+  startWork: async (request, response, next) => {
+    if (!isUuid(request.params.transactionId)) return next(validationError());
+    const input = deliveryStartSchema.safeParse(request.body); if (!input.success) return next(validationError());
+    try { return response.status(200).json({ success: true, message: "Work started", data: await deliveryService.startWork({ auth: request.auth, transactionId: request.params.transactionId, ...input.data, requestId: request.requestId }) }); }
+    catch (error) { return forward(error, next); }
+  },
+  submitDelivery: async (request, response, next) => {
+    if (!isUuid(request.params.transactionId)) return next(validationError());
+    const input = deliverySubmitSchema.safeParse(request.body); if (!input.success) return next(validationError());
+    try { return response.status(201).json({ success: true, message: "Delivery submitted", data: await deliveryService.submitDelivery({ auth: request.auth, transactionId: request.params.transactionId, ...input.data, requestId: request.requestId }) }); }
+    catch (error) { return forward(error, next); }
+  },
+  deliveryHistory: async (request, response, next) => {
+    if (!isUuid(request.params.transactionId)) return next(validationError());
+    try { return response.status(200).json({ success: true, message: "Delivery history", data: await deliveryService.getHistory({ auth: request.auth, transactionId: request.params.transactionId }) }); }
+    catch (error) { return forward(error, next); }
+  },
+  decideDelivery: async (request, response, next) => {
+    if (!isUuid(request.params.transactionId)) return next(validationError());
+    const input = deliveryDecisionSchema.safeParse(request.body); if (!input.success) return next(validationError());
+    try { return response.status(200).json({ success: true, message: "Delivery decision recorded", data: await deliveryService.decideDelivery({ auth: request.auth, transactionId: request.params.transactionId, ...input.data, requestId: request.requestId }) }); }
+    catch (error) { return forward(error, next); }
+  },
+  uploadDeliveryEvidence: async (request, response, next) => {
+    if (!isUuid(request.params.transactionId) || !isUuid(request.params.deliveryId) || !/^[A-Z][A-Z0-9_]{1,63}$/.test(request.get("x-evidence-category") ?? "")) return next(validationError());
+    try { return response.status(201).json({ success: true, message: "Delivery evidence stored", data: await deliveryService.uploadEvidence({ auth: request.auth, transactionId: request.params.transactionId, deliveryId: request.params.deliveryId, body: request.body, contentType: request.get("content-type")?.split(";", 1)[0].toLowerCase(), filename: request.get("x-evidence-filename"), category: request.get("x-evidence-category"), requestId: request.requestId }) }); }
+    catch (error) { return forward(error, next); }
+  },
+  downloadDeliveryEvidence: async (request, response, next) => {
+    if (!isUuid(request.params.evidenceId)) return next(validationError());
+    try { const file = await deliveryService.downloadEvidence({ auth: request.auth, evidenceId: request.params.evidenceId, requestId: request.requestId }); response.set("Content-Type", file.contentType); response.set("Content-Disposition", `attachment; filename="${file.filename.replace(/["\\\r\n]/g, "_")}"`); response.set("X-Content-Type-Options", "nosniff"); response.set("Cache-Control", "private, no-store"); return response.status(200).send(file.body); }
     catch (error) { return forward(error, next); }
   },
 });

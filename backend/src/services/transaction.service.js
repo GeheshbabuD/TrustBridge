@@ -3,6 +3,8 @@ import { getEnv } from "../config/env.js";
 import { getPrismaClient } from "../config/db.js";
 import { ApiError } from "../utils/ApiError.js";
 import { PARTICIPANT_TRANSITIONS, serializeStatusHistory, serializeTermsVersion, serializeTransaction } from "../models/transaction.model.js";
+import { enqueueTransactionNotice } from "./notification-event.service.js";
+import { enqueueBlockchainStatusCommitment } from "./blockchain-event-hash.service.js";
 
 const notFound = () => new ApiError(404, "RESOURCE_NOT_FOUND", "Resource not found");
 const forbidden = () => new ApiError(403, "FORBIDDEN", "Access is not permitted");
@@ -115,8 +117,10 @@ export const createTransactionService = ({ getClient = getPrismaClient, now = ()
           transactionId: transaction.id, version: 1, previousStatus: null, newStatus: "CREATED",
           actorUserId: auth.userId, reason: "TRANSACTION_CREATED",
         } });
+        await enqueueBlockchainStatusCommitment(tx, { transactionId: transaction.id, version: 1, previousStatus: null, newStatus: "CREATED" });
         await recordAudit(tx, auth.userId, "TRANSACTION_CREATED", transaction.id, requestId, { status: "CREATED", version: 1, termsVersion: 1 });
         await recordAudit(tx, auth.userId, "TRANSACTION_TERMS_PROPOSED", transaction.id, requestId, { termsVersion: 1 });
+        await enqueueTransactionNotice(tx, { transactionId: transaction.id, template: "TRANSACTION_CREATED", discriminator: "v1" });
         await tx.idempotencyOperation.update({
           where: { operationScope_idempotencyKey: { operationScope: scope, idempotencyKey } },
           data: { status: "COMPLETED", resourceType: "Transaction", resourceId: transaction.id, completedAt: now() },
@@ -319,6 +323,7 @@ export const createTransactionService = ({ getClient = getPrismaClient, now = ()
         });
         if (invitationUpdate.count !== 1) throw invitationInvalid();
         await recordAudit(tx, auth.userId, `TRANSACTION_INVITATION_${decision}`, transaction.id, requestId, { invitationId: invitation.id });
+        await enqueueTransactionNotice(tx, { transactionId: transaction.id, template: "TRANSACTION_STATUS_CHANGED", discriminator: `invitation:${decision}:${expectedVersion}` });
         if (decision === "REJECTED") {
           const transitionUpdate = await tx.transaction.updateMany({
             where: { id: transaction.id, status: "CREATED", version: expectedVersion },
@@ -329,6 +334,7 @@ export const createTransactionService = ({ getClient = getPrismaClient, now = ()
             transactionId: transaction.id, version: expectedVersion + 1, previousStatus: "CREATED", newStatus: "REJECTED",
             actorUserId: auth.userId, reason: "SELLER_DECLINED",
           } });
+          await enqueueBlockchainStatusCommitment(tx, { transactionId: transaction.id, version: expectedVersion + 1, previousStatus: "CREATED", newStatus: "REJECTED" });
           await tx.transactionInvitation.updateMany({ where: { transactionId: transaction.id, status: "PENDING" }, data: { status: "REVOKED", revokedAt: stamp } });
           await recordAudit(tx, auth.userId, "TRANSACTION_STATUS_CHANGED", transaction.id, requestId, { previousStatus: "CREATED", newStatus: "REJECTED", version: expectedVersion + 1, participantRole: "SELLER" });
         }
@@ -400,11 +406,13 @@ export const createTransactionService = ({ getClient = getPrismaClient, now = ()
           transactionId, version: nextVersion, previousStatus: transaction.status, newStatus: status,
           actorUserId: auth.userId, reason: rule.reasonCode,
         } });
+        await enqueueBlockchainStatusCommitment(tx, { transactionId, version: nextVersion, previousStatus: transaction.status, newStatus: status });
         await tx.transactionInvitation.updateMany({ where: { transactionId, status: "PENDING" }, data: { status: "REVOKED", revokedAt: now() } });
         await tx.transactionTermsVersion.updateMany({ where: { transactionId, status: "PENDING" }, data: { status: "SUPERSEDED" } });
         await recordAudit(tx, auth.userId, "TRANSACTION_STATUS_CHANGED", transactionId, requestId, {
           previousStatus: transaction.status, newStatus: status, version: nextVersion, participantRole: role,
         });
+        await enqueueTransactionNotice(tx, { transactionId, template: "TRANSACTION_STATUS_CHANGED", discriminator: `v${nextVersion}:${status}` });
         const result = await tx.transaction.findUnique({ where: { id: transactionId }, select: transactionWithParticipants });
         return serializeTransaction(result);
       });

@@ -15,7 +15,6 @@ return hits
 const COMMAND_TIMEOUT_MS = 5000;
 const withTimeout = (promise) => new Promise((resolve, reject) => {
   const timer = setTimeout(() => reject(new RateLimitStoreUnavailableError()), COMMAND_TIMEOUT_MS);
-  timer.unref?.();
   promise.then(resolve, reject).finally(() => clearTimeout(timer));
 });
 
@@ -114,7 +113,9 @@ export class RedisRateLimitStore {
   }
 
   async close() {
-    if (this.#client.isOpen) await this.#client.quit().catch(() => {});
+    if (!this.#client.isOpen) return;
+    try { await withTimeout(this.#client.quit()); }
+    catch { await this.#client.disconnect?.().catch(() => {}); }
   }
 }
 

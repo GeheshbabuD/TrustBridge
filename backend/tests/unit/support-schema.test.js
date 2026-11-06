@@ -21,6 +21,9 @@ test("disputes use the existing status enum and real transaction/user relations"
   assert.match(dispute, /category\s+String/);
   assert.match(dispute, /description\s+String/);
   assert.match(dispute, /resolvedAt\s+DateTime\?/);
+  assert.match(dispute, /evidenceDeadlineAt\s+DateTime\?/);
+  assert.match(dispute, /responseDeadlineAt\s+DateTime\?/);
+  assert.match(dispute, /version\s+Int/);
   assert.match(dispute, /@@index\(\[transactionId, status, createdAt\]/);
   assert.match(dispute, /onDelete: Restrict/g);
   assert.match(user, /openedDisputes\s+Dispute\[\]/);
@@ -28,9 +31,25 @@ test("disputes use the existing status enum and real transaction/user relations"
   assert.doesNotMatch(dispute, /@@unique\(\[transactionId\]/);
 });
 
-test("evidence stores private metadata references only and retains dispute/uploader relations", () => {
+test("dispute activities persist versioned responses and decisions with restrictive relations", () => {
+  const activity = modelBlock("DisputeActivity");
+  assert.match(schema, /enum DisputeActivityType\s*\{[\s\S]*?OPENED[\s\S]*?RESPONSE[\s\S]*?RESOLVED/);
+  assert.match(activity, /dispute\s+Dispute\s+@relation/);
+  assert.match(activity, /actorUserId\s+String\?/);
+  assert.match(activity, /sequence\s+Int/);
+  assert.match(activity, /message\s+String\?/);
+  assert.match(activity, /metadata\s+Json\?/);
+  assert.match(activity, /@@unique\(\[disputeId, sequence\]/);
+  assert.match(activity, /onDelete: Restrict/g);
+  assert.doesNotMatch(activity, /fileContents?|privateKey|tokenHash/i);
+});
+
+test("evidence stores private metadata references only and retains dispute/delivery/uploader relations", async () => {
   const evidence = modelBlock("Evidence");
-  assert.match(evidence, /dispute\s+Dispute\s+@relation/);
+  assert.match(evidence, /disputeId\s+String\?/);
+  assert.match(evidence, /transactionDeliveryId\s+String\?/);
+  assert.match(evidence, /dispute\s+Dispute\?\s+@relation/);
+  assert.match(evidence, /delivery\s+TransactionDelivery\?\s+@relation/);
   assert.match(evidence, /uploadedBy\s+User\s+@relation\("EvidenceUploader"/);
   assert.match(evidence, /storageObjectKey\s+String\s+@unique/);
   assert.match(evidence, /originalFilename\s+String\?/);
@@ -38,8 +57,12 @@ test("evidence stores private metadata references only and retains dispute/uploa
   assert.match(evidence, /sizeBytes\s+BigInt/);
   assert.match(evidence, /sha256Hash\s+String/);
   assert.match(evidence, /@@index\(\[disputeId, createdAt\]/);
-  assert.equal((evidence.match(/onDelete: Restrict/g) ?? []).length, 2);
+  assert.equal((evidence.match(/onDelete: Restrict/g) ?? []).length, 3);
   assert.doesNotMatch(evidence, /fileContents?\s|publicUrl|downloadUrl|signedUrl|accessToken|credential/i);
+  const migration = await readFile(new URL("../../prisma/migrations/20261107110000_transaction_delivery_workflow/migration.sql", import.meta.url), "utf8");
+  assert.match(migration, /evidence_exactly_one_parent_check/);
+  assert.match(migration, /ALTER TABLE "evidence" ALTER COLUMN "dispute_id" DROP NOT NULL/);
+  assert.doesNotMatch(migration, /\b(DROP TABLE|TRUNCATE|DELETE FROM|DROP TYPE)\b/i);
 });
 
 test("notifications belong to a recipient and use durable read/dedupe fields", () => {
@@ -74,7 +97,7 @@ test("audit logs support optional actors, correlation and append-only schema sha
 });
 
 test("support schema has no cascading deletion or floating/decimal monetary fields", () => {
-  for (const modelName of ["Dispute", "Evidence", "Notification", "AuditLog"]) {
+  for (const modelName of ["Dispute", "DisputeActivity", "Evidence", "Notification", "AuditLog"]) {
     assert.doesNotMatch(modelBlock(modelName), /onDelete:\s*Cascade/);
   }
   assert.doesNotMatch(schema, /\b(Float|Decimal)\b/);

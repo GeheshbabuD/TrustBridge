@@ -72,6 +72,10 @@ export const transactionTransitionSchema = z.object({
   expectedVersion: z.number().int().positive().max(2147483647),
 }).strict();
 
+export const deliveryStartSchema = z.object({ expectedVersion: z.number().int().positive().max(2147483647) }).strict();
+export const deliverySubmitSchema = z.object({ expectedVersion: z.number().int().positive().max(2147483647), description: z.string().trim().min(1).max(4000) }).strict();
+export const deliveryDecisionSchema = z.object({ deliveryId: z.string().uuid(), expectedVersion: z.number().int().positive().max(2147483647), decision: z.enum(["ACCEPTED", "CHANGES_REQUESTED"]), reason: z.string().trim().min(1).max(2000).optional() }).strict();
+
 export const transactionHistoryQuerySchema = z.object({
   cursor: z.string().regex(/^[1-9]\d{0,9}$/).refine((value) => Number(value) <= 2147483647).optional(),
   limit: z.string().regex(/^\d{1,2}$/).default("25").transform(Number).pipe(z.number().int().min(1).max(100)),

@@ -189,14 +189,15 @@ test("unverified status lookup cannot change a payment outcome", async () => {
 
 test("signed checkout callback is confirmed by provider API before capture is persisted", async () => {
   const { prisma, state } = fixture();
-  state.attempt = { id: "attempt-1", transactionId, provider: "trustbridge-test", providerReference: "order_1", amountMinor: 5500n, currency: "INR", status: "PENDING", createdAt: new Date(), updatedAt: new Date() };
+  state.attempt = { id: "attempt-1", transactionId, provider: "razorpay", providerReference: "order_1", amountMinor: 5500n, currency: "INR", status: "PENDING", createdAt: new Date(), updatedAt: new Date() };
   prisma.paymentAttempt.findFirst = async () => state.attempt;
   const base = createDeterministicPaymentTestAdapter();
-  const adapter = { ...base, verifyPaymentSignature: () => true, fetchPaymentDetails: async () => ({ paymentId: "pay_1", orderId: "order_1", amountMinor: "5500", currency: "INR", status: "captured" }) };
+  const adapter = { ...base, providerId: "razorpay", verifyPaymentSignature: () => true, fetchPaymentDetails: async () => ({ paymentId: "pay_1", orderId: "order_1", amountMinor: "5500", currency: "INR", status: "captured" }) };
   const service = createPaymentService({ getClient: async () => prisma, adapter, provider: adapter.providerId, enabled: true });
   const result = await service.verifyPaymentCallback({ auth: { userId: buyerId, authVersion: 4, role: "USER" }, paymentAttemptId: "attempt-1", orderId: "order_1", paymentId: "pay_1", signature: "a".repeat(64) });
   assert.equal(result.captured, true);
   assert.equal(state.attempt.status, "CAPTURED");
+  assert.equal(state.attempt.capturedPaymentId, "pay_1");
   assert.equal(state.webhooks[0].eventType, "payment.checkout_verified");
   assert.equal(state.audits[0].action, "PAYMENT_ATTEMPT_CAPTURE_VERIFIED");
 });

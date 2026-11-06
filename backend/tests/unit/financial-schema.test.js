@@ -49,6 +49,16 @@ test("payment attempts keep independent status, provider reference and scoped id
   assert.doesNotMatch(attempt, /cardNumber|cvv|secret|payload/i);
 });
 
+test("captured provider payment reference is separate, nullable for legacy rows and uniquely scoped", async () => {
+  const attempt = modelBlock("PaymentAttempt");
+  assert.match(attempt, /capturedPaymentId\s+String\?\s+@map\("captured_payment_id"\)\s+@db\.VarChar\(255\)/);
+  assert.match(attempt, /@@unique\(\[provider, capturedPaymentId\], map: "payment_attempts_provider_captured_payment_key"\)/);
+  const migration = await readFile(new URL("../../prisma/migrations/20261106100000_captured_payment_reference/migration.sql", import.meta.url), "utf8");
+  assert.match(migration, /ADD COLUMN "captured_payment_id" VARCHAR\(255\)/);
+  assert.match(migration, /CREATE UNIQUE INDEX "payment_attempts_provider_captured_payment_key"/);
+  assert.doesNotMatch(migration, /DROP|TRUNCATE|DELETE\s+FROM|UPDATE\s+"payment_attempts"/i);
+});
+
 test("escrow is one currency-matched internal record per transaction and restricts deletion", () => {
   const escrow = modelBlock("Escrow");
   assert.match(escrow, /transactionId\s+String/);

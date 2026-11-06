@@ -128,6 +128,20 @@ enum DisputeStatus {
   CLOSED
 }
 
+enum DisputeActivityType {
+  OPENED
+  REVIEW_STARTED
+  RESPONSE
+  EVIDENCE_ADDED
+  RESOLVED
+  CLOSED
+}
+
+enum DeliveryDecisionType {
+  ACCEPTED
+  CHANGES_REQUESTED
+}
+
 enum ProviderOperationStatus {
   PENDING
   SUCCEEDED
@@ -209,6 +223,7 @@ model User {
   openedDisputes                 Dispute[]                  @relation("DisputeOpenedBy")
   resolvedDisputes               Dispute[]                  @relation("DisputeResolvedBy")
   uploadedEvidence               Evidence[]                 @relation("EvidenceUploader")
+  disputeActivities              DisputeActivity[]
   notifications                  Notification[]             @relation("NotificationRecipient")
   auditLogs                      AuditLog[]                 @relation("AuditActor")
   riskAssessmentsReviewed        RiskAssessment[]           @relation("RiskAssessmentReviewer")
@@ -226,6 +241,8 @@ model User {
   sentTransactionInvitations     TransactionInvitation[]    @relation("TransactionInvitationInviter")
   receivedTransactionInvitations TransactionInvitation[]    @relation("TransactionInvitationInvitee")
   escrowOperations               EscrowOperation[]          @relation("EscrowOperationActor")
+  submittedDeliveries            TransactionDelivery[]       @relation("DeliverySubmitter")
+  deliveryDecisions              DeliveryDecision[]          @relation("DeliveryDecisionActor")
 
   @@index([status, createdAt], map: "users_status_created_at_idx")
   @@index([role, status], map: "users_role_status_idx")
@@ -276,6 +293,7 @@ model Transaction {
   termsVersions     TransactionTermsVersion[]
   invitations       TransactionInvitation[]
   escrowOperations  EscrowOperation[]
+  deliveries        TransactionDelivery[]
 
   // Composite references below keep all transaction-bound financial rows in
   // this transaction's currency. id is already primary; this key supports FKs.
@@ -367,6 +385,7 @@ model PaymentAttempt {
   transactionId     String               @map("transaction_id") @db.Uuid
   provider          String               @db.VarChar(64)
   providerReference String?              @map("provider_reference") @db.VarChar(255)
+  capturedPaymentId String?              @map("captured_payment_id") @db.VarChar(255)
   idempotencyKey    String               @map("idempotency_key") @db.VarChar(128)
   status            PaymentAttemptStatus @default(CREATED)
   amountMinor       BigInt               @map("amount_minor")
@@ -381,6 +400,7 @@ model PaymentAttempt {
 
   @@unique([transactionId, idempotencyKey], map: "payment_attempts_transaction_idempotency_key")
   @@unique([provider, providerReference], map: "payment_attempts_provider_reference_key")
+  @@unique([provider, capturedPaymentId], map: "payment_attempts_provider_captured_payment_key")
   @@index([transactionId, status, createdAt], map: "payment_attempts_transaction_status_created_idx")
   @@index([provider, status], map: "payment_attempts_provider_status_idx")
   @@map("payment_attempts")
@@ -511,23 +531,28 @@ model EscrowOperation {
 }
 
 model Dispute {
-  id            String        @id @default(uuid()) @db.Uuid
-  transactionId String        @map("transaction_id") @db.Uuid
-  openedById    String        @map("opened_by_id") @db.Uuid
-  resolvedById  String?       @map("resolved_by_id") @db.Uuid
-  status        DisputeStatus @default(OPEN)
-  category      String        @db.VarChar(80)
-  description   String        @db.VarChar(4000)
-  resolution    String?       @db.VarChar(4000)
-  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
-  updatedAt     DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
-  resolvedAt    DateTime?     @map("resolved_at") @db.Timestamptz(6)
-  closedAt      DateTime?     @map("closed_at") @db.Timestamptz(6)
+  id                    String        @id @default(uuid()) @db.Uuid
+  transactionId         String        @map("transaction_id") @db.Uuid
+  openedById            String        @map("opened_by_id") @db.Uuid
+  resolvedById          String?       @map("resolved_by_id") @db.Uuid
+  status                DisputeStatus @default(OPEN)
+  category              String        @db.VarChar(80)
+  description           String        @db.VarChar(4000)
+  resolution            String?       @db.VarChar(4000)
+  createdAt             DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt             DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  resolvedAt            DateTime?     @map("resolved_at") @db.Timestamptz(6)
+  closedAt              DateTime?     @map("closed_at") @db.Timestamptz(6)
+  version               Int           @default(1)
+  evidenceDeadlineAt    DateTime?     @map("evidence_deadline_at") @db.Timestamptz(6)
+  responseDeadlineAt    DateTime?     @map("response_deadline_at") @db.Timestamptz(6)
+  resolutionAmountMinor BigInt?       @map("resolution_amount_minor")
 
-  transaction Transaction  @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-  openedBy    User         @relation("DisputeOpenedBy", fields: [openedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
-  resolvedBy  User?        @relation("DisputeResolvedBy", fields: [resolvedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  transaction Transaction       @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  openedBy    User              @relation("DisputeOpenedBy", fields: [openedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  resolvedBy  User?             @relation("DisputeResolvedBy", fields: [resolvedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
   evidence    Evidence[]
+  activities  DisputeActivity[]
   aiAnalyses  AIAnalysis[]
 
   // The domain design allows multiple disputes over a transaction lifecycle;
@@ -539,9 +564,62 @@ model Dispute {
   @@map("disputes")
 }
 
+model TransactionDelivery {
+  id            String   @id @default(uuid()) @db.Uuid
+  transactionId String   @map("transaction_id") @db.Uuid
+  sequence      Int
+  submittedById String   @map("submitted_by_id") @db.Uuid
+  description   String   @db.VarChar(4000)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  transaction Transaction         @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  submittedBy User                @relation("DeliverySubmitter", fields: [submittedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  decision    DeliveryDecision?
+  evidence    Evidence[]
+
+  @@unique([transactionId, sequence], map: "transaction_deliveries_transaction_sequence_key")
+  @@index([transactionId, createdAt], map: "transaction_deliveries_transaction_created_idx")
+  @@map("transaction_deliveries")
+}
+
+model DeliveryDecision {
+  id          String               @id @default(uuid()) @db.Uuid
+  deliveryId  String               @unique(map: "delivery_decisions_delivery_id_key") @map("delivery_id") @db.Uuid
+  actorUserId String               @map("actor_user_id") @db.Uuid
+  decision    DeliveryDecisionType
+  reason      String?              @db.VarChar(2000)
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  delivery TransactionDelivery @relation(fields: [deliveryId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  actor    User                @relation("DeliveryDecisionActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@index([actorUserId, createdAt], map: "delivery_decisions_actor_created_idx")
+  @@map("delivery_decisions")
+}
+
+model DisputeActivity {
+  id          String              @id @default(uuid()) @db.Uuid
+  disputeId   String              @map("dispute_id") @db.Uuid
+  sequence    Int
+  actorUserId String?             @map("actor_user_id") @db.Uuid
+  type        DisputeActivityType
+  message     String?             @db.VarChar(4000)
+  metadata    Json?               @db.JsonB
+  createdAt   DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  dispute Dispute @relation(fields: [disputeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  actor   User?   @relation(fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([disputeId, sequence], map: "dispute_activities_dispute_sequence_key")
+  @@index([disputeId, createdAt], map: "dispute_activities_dispute_created_idx")
+  @@index([actorUserId, createdAt], map: "dispute_activities_actor_created_idx")
+  @@map("dispute_activities")
+}
+
 model Evidence {
   id               String   @id @default(uuid()) @db.Uuid
-  disputeId        String   @map("dispute_id") @db.Uuid
+  disputeId        String?  @map("dispute_id") @db.Uuid
+  transactionDeliveryId String? @map("transaction_delivery_id") @db.Uuid
   uploadedById     String   @map("uploaded_by_id") @db.Uuid
   category         String   @db.VarChar(80)
   // Opaque private-storage key only; this is not a URL or an access capability.
@@ -552,10 +630,12 @@ model Evidence {
   sha256Hash       String   @map("sha256_hash") @db.Char(64)
   createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  dispute    Dispute @relation(fields: [disputeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-  uploadedBy User    @relation("EvidenceUploader", fields: [uploadedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  dispute    Dispute? @relation(fields: [disputeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  delivery   TransactionDelivery? @relation(fields: [transactionDeliveryId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  uploadedBy User     @relation("EvidenceUploader", fields: [uploadedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@index([disputeId, createdAt], map: "evidence_dispute_created_idx")
+  @@index([transactionDeliveryId, createdAt], map: "evidence_delivery_created_idx")
   @@index([uploadedById, createdAt], map: "evidence_uploader_created_idx")
   @@map("evidence")
 }

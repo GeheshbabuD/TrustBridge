@@ -72,3 +72,11 @@ test("Redis store applies atomic increment-and-expiry script and sanitizes clien
   class FailedRedis extends FakeRedis { async eval() { throw new Error("private redis endpoint detail"); } }
   await assert.rejects(new RedisRateLimitStore({ client: new FailedRedis() }).increment("key", 1000), RateLimitStoreUnavailableError);
 });
+
+test("Redis store close disconnects safely when graceful quit fails", async () => {
+  let disconnected = false;
+  const client = { isOpen: true, on() {}, quit: async () => { throw new Error("provider detail"); }, disconnect: async () => { disconnected = true; } };
+  const store = new RedisRateLimitStore({ client });
+  await store.close();
+  assert.equal(disconnected, true);
+});

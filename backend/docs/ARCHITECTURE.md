@@ -2,6 +2,12 @@
 
 Client → Express API v1 → security/auth/role/validation middleware → routes/controllers → domain services/state machine → Prisma models → PostgreSQL. Provider adapters isolate payment, notifications, AI and blockchain. Services own business rules; controllers only map HTTP; routes stay declarative.
 
+## TB-BE-091 deterministic risk baseline
+
+The AI module provides a separate deterministic baseline service alongside TB-BE-090's optional provider adapter. The baseline reads the same minimized, versioned transaction/payment/dispute aggregates under user-then-transaction row locks and persists append-only `RiskAssessment` rows. `AIAnalysis` remains the provenance store for external provider outputs. The route requires authenticated ADMIN, recent TOTP and a distinct shared rate-limit bucket; participants cannot retrieve internal findings. Baseline output is advisory review priority only and does not call a provider or mutate transaction, financial or account state.
+
+TB-BE-092 adds a separate `createAiDisputeService` over the same configured adapter contract. It accepts only persisted `UNDER_REVIEW` disputes, count-only allowlisted evidence metadata and bounded identifier-redacted narrative; evidence contents, filenames, object keys and actor/transaction IDs are excluded. The admin route requires one-time dispute-bound `DISPUTE_REVIEW` step-up and a dedicated shared limiter. It appends a pending `AIAnalysis` with dispute version provenance and rejects stale results. AI output remains subordinate to the existing human review/resolution service.
+
 The approved local development/testing database target is PostgreSQL 17.10 at `localhost:5432/Trustbridge`. The project uses Prisma ORM/CLI/client/PostgreSQL adapter 7.10.1; Prisma ORM 7 supports PostgreSQL 17.
 
 TB-BE-025 applied `prisma/migrations/20261102153537_init/migration.sql` to the approved local PostgreSQL 17.10 database `Trustbridge` at `localhost:5432`. Prisma records one successful migration and reports the schema up to date. Direct catalog verification found 15 enums, 21 application tables, 98 indexes (77 explicit migration indexes plus 21 primary-key backing indexes), 33 restrictive foreign keys and 11 validated custom checks. Constraint probes ran in a transaction that was rolled back. No reset/drop/truncate or production database operation occurred.
@@ -12,7 +18,7 @@ The migration contains named row-level CHECK constraints for normalized email, p
 
 ## TB-BE-024 schema boundary
 
-The canonical Prisma schema now includes `RiskAssessment`, `AIAnalysis`, `BlockchainRecord` and `RefreshToken`. These are persistence declarations only: no AI provider, blockchain client, wallet/signing, token generation/rotation API, or workflow/outbox was added. Multiple AI and chain records may exist per subject; nullable AI subject relations are supported, and application validation must require at least one subject. Human review and chain verification remain later service responsibilities.
+The canonical Prisma schema includes `RiskAssessment`, `AIAnalysis`, `BlockchainRecord` and `RefreshToken`. The AI provider service and deterministic baseline are described in TB-BE-090/091. Multiple analysis and chain records may exist per subject; nullable AI subject relations are supported, and application validation must require at least one subject. Human review and chain verification remain later service responsibilities.
 
 ```mermaid
 flowchart LR
@@ -73,6 +79,8 @@ Refresh sessions now persist one of `PASSWORD_ONLY`, `TOTP_VERIFIED`, or `RECOVE
 Password login issues `PASSWORD_ONLY`. TOTP login issues `TOTP_VERIFIED` and its verification timestamp. The existing login challenge endpoint also accepts a 32-hex-character recovery code; its hash is consumed atomically with challenge consumption and the resulting session is marked `RECOVERY_CODE_VERIFIED`, without fabricating TOTP time. Refresh copies the persisted level and timestamp exactly, rechecks account status, authVersion, active MFA, enrollment timing and session lifecycle, and never upgrades assurance. Purpose-bound step-up and recent-MFA authorization require `TOTP_VERIFIED`; recovery assurance cannot satisfy them. No schema change or migration was required for A1.2.
 # TB-BE-050 guarded transaction lifecycle
 
+Transaction delivery is implemented in `transaction-delivery.service.js`, with thin HTTP handlers and strict Zod commands. Seller work start checks funded escrow; seller submission and buyer decision lock the shared transaction row and update transaction version/history/audit together. Delivery evidence uses the same private evidence-storage abstraction as disputes and remains metadata-only in PostgreSQL. Payment, dispute resolution, release authorization, provider execution and ledger finalization remain separate services.
+
 Transaction service policy is the sole authority for status transitions. It retains participant-derived buyer/seller roles, active account/authVersion checks, transaction row locking, expected-version compare-and-set, and atomic status-history/audit writes. Awaiting-payment cancellation is guarded by persisted `PaymentAttempt` existence; because provider verification is not implemented, any attempt blocks cancellation. Future attempt creation must acquire the transaction row lock before writing. Payment, escrow, dispute, transaction and payout workflows remain separate services; this task adds no provider or settlement logic.
 
 ## TB-BE-051 terms and invitation workflow
@@ -93,3 +101,20 @@ Razorpay is composed behind the existing payment adapter interface only when sel
 Payment service calls the escrow funding recorder only after existing provider verification, inside its transaction-row-locked database transaction. It matches persisted transaction amount/currency and atomically writes escrow status/balance, unique funding operation, two-entry BigInt journal, transaction `FUNDED` history and audit. Release/refund APIs record one-time TOTP step-up-gated authorization and outbox work. The service revalidates account status/authVersion, exact live TOTP session/MFA enrollment, role and transaction/dispute state under transaction→user→session→MFA locks. Provider calls are outside DB transactions. Only an injected, verified outcome matching amount/currency can finalize and post the ledger journal. Default composition has no release/refund executor and leaves work pending. AI/blockchain data are not inputs to this authorization path.
 
 Execution claims use one conditional `EscrowOperation.updateMany` lease acquisition (pending, due, lease absent/expired, attemptCount under five). Provider timeout/mismatch releases the lease and schedules a retry with a static safe error code; simultaneous workers cannot both call the executor. Exhausted attempts remain pending for manual reconciliation. Migration `20261104131000_escrow_execution_leases` provides the retry fields and index.
+
+### TB-BE-039 Phase 2 runtime integration (2026-11-06)
+
+`composeEscrowRuntime` connects approval-gated provider executors and persisted-operation authorization callbacks. The server starts the worker only after HTTP listen and drains an active tick before shutdown. DB leases provide cross-instance exclusion; local timer overlap is suppressed. Missing provider approval or Route account resolution leaves the relevant executor unavailable, without blocking ordinary HTTP startup.
+
+## TB-BE-090 transaction risk assessment
+
+`ai.service.js` gathers a repeatable-read snapshot containing only transaction status, integer minor amount/currency, age/version, and counts of payment-attempt/dispute statuses. It excludes names, emails, user IDs, descriptions, terms text, evidence, provider references and credentials. The assessment route is ADMIN-only, requires recent TOTP, validates a UUID and empty strict body, and uses a dedicated shared rate-limit bucket. `ai-provider.adapter.js` implements the vendor-neutral `trustbridge.ai.transaction-risk.v1` JSON gateway contract; provider, endpoint, model identifier/version and API key come from validated config. Redirects are disabled, responses are bounded, model provenance must match config, schema is strict, and at most one transient retry is made.
+
+The result is stored in existing `AIAnalysis` as pending human review with input-data and transaction-version provenance. If transaction version changes while inference runs, persistence is rejected as stale. Neither model output nor service code is connected to transaction, payment, escrow, ledger, user-status or dispute-decision mutation. Provider configuration defaults disabled; no provider credentials or live call were used.
+# TB-BE-041 Notifications and email
+
+Domain events enqueue `USER_NOTIFICATION` outbox rows in the same business transaction. A supervised worker claims rows with the existing persisted lease fields, applies the recipient's notification preferences, and upserts a deduplicated in-app notification. HTTP handlers expose only recipient-owned list/read operations. Email is behind an injected provider-neutral adapter; no concrete production provider or credentials are configured. Worker retries are bounded and store only a sanitized error code. Provider delivery must support idempotency because a process can fail after provider acceptance but before the outbox acknowledgement.
+
+## TB-BE-043 blockchain adapter
+
+Transaction status-history services can enqueue hash-only `BlockchainRecord` plus outbox intent atomically. The Ethers adapter and supervised worker submit commitments and reconcile canonical receipts; the app fails closed if blockchain is explicitly enabled without an injected signer adapter. No blockchain endpoint or financial workflow is added. PostgreSQL remains authoritative, and no remote/testnet client is configured in the repository.

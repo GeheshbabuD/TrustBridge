@@ -2,11 +2,14 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { getDatabaseUrl } from "../../src/config/env.js";
+import { createEscrowService } from "../../src/services/escrow.service.js";
 import { createPaymentService } from "../../src/services/payment.service.js";
 import { createDeterministicPaymentTestAdapter } from "../support/payment-test-adapter.js";
 import { createTransactionService } from "../../src/services/transaction.service.js";
 
 const enabled = process.env.TRUSTBRIDGE_PAYMENT_PG_TESTS === "1";
+const testDatabase = process.env.TRUSTBRIDGE_PG_TEST_DATABASE ?? "trustbridge_test";
+assert.ok(["trustbridge_test", "trustbridge_tb050_clean"].includes(testDatabase), "only approved isolated PostgreSQL test databases are allowed");
 const barrier = (parties = 2) => {
   let arrivals = 0; let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -18,7 +21,7 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
   assert.ok(["localhost", "127.0.0.1", "::1"].includes(baseline.hostname));
   assert.equal(baseline.port || "5432", "5432");
   assert.equal(baseline.pathname, "/Trustbridge");
-  const testUrl = new URL(baseline); testUrl.pathname = "/trustbridge_test";
+  const testUrl = new URL(baseline); testUrl.pathname = `/${testDatabase}`;
   const [{ PrismaClient }, { PrismaPg }, { Client }] = await Promise.all([
     import("../../generated/prisma/client.ts"), import("@prisma/adapter-pg"), import("pg"),
   ]);
@@ -31,7 +34,7 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
   const row = identity.rows[0];
   const isLoopback = (value) => ["127.0.0.1", "127.0.0.1/32", "::1", "::1/128", "::ffff:127.0.0.1", "::ffff:127.0.0.1/128"].includes(value);
   const applied = migrations.rows.filter((entry) => entry.finished_at && !entry.rolled_back_at).map((entry) => entry.migration_name).sort();
-  assert.equal(row.database, "trustbridge_test");
+  assert.equal(row.database, testDatabase);
   assert.match(row.version, /^17\./);
   assert.equal(row.port, "5432");
   assert.ok(isLoopback(row.server_address));
@@ -46,8 +49,10 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
   const makeClient = () => new PrismaClient({ adapter: new PrismaPg({ connectionString: testUrl.toString() }) });
   const [a, b] = [makeClient(), makeClient()];
   const userIds = new Set(); const transactionIds = new Set(); const idemKeys = new Set();
+  const preserveFinancialTransactions = new Set(); const preserveFinancialUsers = new Set();
+  const preexistingFixtureUsers = new Set((await a.user.findMany({ where: { email: { endsWith: "@tb038-pg.invalid" } }, select: { id: true } })).map((row) => row.id));
   const adapter = createDeterministicPaymentTestAdapter();
-  const payment = (client, activeAdapter = adapter) => createPaymentService({ getClient: async () => client, adapter: activeAdapter, provider: activeAdapter.providerId, enabled: true, fingerprintSecret: "isolated-payment-pg-test-fingerprint" });
+  const payment = (client, activeAdapter = adapter, fundVerifiedCapture = false) => createPaymentService({ getClient: async () => client, adapter: activeAdapter, provider: activeAdapter.providerId, enabled: true, fingerprintSecret: "isolated-payment-pg-test-fingerprint", ...(fundVerifiedCapture ? { fundingService: createEscrowService({ getClient: async () => client }) } : {}) });
   const transaction = (client) => createTransactionService({ getClient: async () => client, fingerprintSecret: "isolated-payment-pg-test-fingerprint" });
   const makeUser = async (client) => {
     const id = randomUUID(); userIds.add(id);
@@ -70,7 +75,7 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
     return { created, buyer, seller, authBuyer, authSeller };
   };
   const cleanup = async () => {
-    const txIds = [...transactionIds]; const uIds = [...userIds];
+    const txIds = [...transactionIds].filter((id) => !preserveFinancialTransactions.has(id)); const uIds = [...userIds].filter((id) => !preserveFinancialUsers.has(id));
     const payments = txIds.length ? await a.paymentAttempt.findMany({ where: { transactionId: { in: txIds } }, select: { id: true } }) : [];
     const pIds = payments.map((paymentAttempt) => paymentAttempt.id);
     if (pIds.length) await a.webhookEvent.deleteMany({ where: { paymentAttemptId: { in: pIds } } });
@@ -128,7 +133,7 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
       const signature = adapter.signTestEvent(rawBody);
       const start = barrier();
       const [capture, cancel] = await Promise.allSettled([
-        (async () => { await start(); return payment(b).receiveWebhook({ provider: adapter.providerId, rawBody, signature }); })(),
+        (async () => { await start(); return payment(b, adapter, true).receiveWebhook({ provider: adapter.providerId, rawBody, signature }); })(),
         (async () => { await start(); return transaction(a).transition({ auth: fixture.authBuyer, transactionId: fixture.created.id, status: "CANCELLED", expectedVersion: 3 }); })(),
       ]);
       assert.equal(capture.status, "fulfilled");
@@ -136,7 +141,15 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
       const stored = await a.paymentAttempt.findUnique({ where: { id: attempt.id } });
       const current = await a.transaction.findUnique({ where: { id: fixture.created.id }, select: { status: true } });
       assert.equal(stored.status, "CAPTURED");
-      assert.equal(current.status, "AWAITING_PAYMENT");
+      assert.equal(current.status, "FUNDED");
+      const fundedEscrow = await a.escrow.findUnique({ where: { transactionId_currency: { transactionId: fixture.created.id, currency: "USD" } } });
+      assert.equal(fundedEscrow.balanceMinor, BigInt(initiated.attempt.amountMinor));
+      assert.equal(await a.ledgerJournal.count({ where: { transactionId: fixture.created.id } }), 1);
+      const journal = await a.ledgerJournal.findFirst({ where: { transactionId: fixture.created.id }, include: { entries: true } });
+      assert.equal(journal.entries.length, 2);
+      assert.equal(journal.entries.reduce((sum, row) => sum + (row.direction === "DEBIT" ? row.amountMinor : -row.amountMinor), 0n), 0n);
+      preserveFinancialTransactions.add(fixture.created.id);
+      preserveFinancialUsers.add(fixture.buyer); preserveFinancialUsers.add(fixture.seller);
       assert.equal(initiated.attempt.amountMinor, "12345");
     });
     await t.test("verified terminal no-capture outcome permits serialized cancellation", async () => {
@@ -157,7 +170,7 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
       const key = `pay-${randomUUID()}`; idemKeys.add(key);
       await assert.rejects(payment(a).initiate({ auth: fixture.authBuyer, transactionId: fixture.created.id, idempotencyKey: key, requestId: "r".repeat(129) }), { code: "PAYMENT_UNAVAILABLE" });
       assert.equal(await a.paymentAttempt.count({ where: { transactionId: fixture.created.id } }), 0);
-      assert.equal(await a.outboxEvent.count({ where: { transactionId: fixture.created.id } }), 0);
+      assert.equal(await a.outboxEvent.count({ where: { transactionId: fixture.created.id, eventType: "PAYMENT_INTENT_CREATE" } }), 0);
       const initiated = await payment(a).initiate({ auth: fixture.authBuyer, transactionId: fixture.created.id, idempotencyKey: key });
       const attempt = await a.paymentAttempt.findFirst({ where: { transactionId: fixture.created.id } });
       const rawBody = Buffer.from(JSON.stringify({ eventId: `evt-${randomUUID()}`, providerReference: attempt.providerReference, outcome: "CAPTURED", amountMinor: attempt.amountMinor.toString(), currency: attempt.currency.trim() }));
@@ -171,7 +184,8 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
     });
   } finally {
     await cleanup();
-    assert.equal(await a.user.count({ where: { email: { endsWith: "@tb038-pg.invalid" } } }), 0, "payment integration fixtures must be fully removed");
+    const remainingFixtureUsers = await a.user.findMany({ where: { email: { endsWith: "@tb038-pg.invalid" } }, select: { id: true } });
+    assert.deepEqual(remainingFixtureUsers.map((row) => row.id).sort(), [...new Set([...preexistingFixtureUsers, ...preserveFinancialUsers])].sort(), "cleanup must preserve pre-existing and explicitly retained fixtures while removing this test's temporary users");
     await Promise.all([a.$disconnect(), b.$disconnect()]);
   }
 });

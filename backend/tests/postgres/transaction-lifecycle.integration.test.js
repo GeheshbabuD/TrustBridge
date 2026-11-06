@@ -5,6 +5,8 @@ import { getDatabaseUrl } from "../../src/config/env.js";
 import { createTransactionService } from "../../src/services/transaction.service.js";
 
 const enabled = process.env.TRUSTBRIDGE_TRANSACTION_PG_TESTS === "1";
+const testDatabase = process.env.TRUSTBRIDGE_PG_TEST_DATABASE ?? "trustbridge_test";
+assert.ok(["trustbridge_test", "trustbridge_tb050_clean"].includes(testDatabase), "only approved isolated PostgreSQL test databases are allowed");
 const createBarrier = (parties = 2) => {
   let arrived = 0; let release;
   const gate = new Promise((resolve) => { release = resolve; });
@@ -16,7 +18,7 @@ test("TB-BE-037/050/051 transaction lifecycle PostgreSQL integration", { skip: !
   assert.equal(baseline.hostname, "localhost");
   assert.equal(baseline.port || "5432", "5432");
   assert.equal(baseline.pathname, "/Trustbridge");
-  const testUrl = new URL(baseline); testUrl.pathname = "/trustbridge_test";
+  const testUrl = new URL(baseline); testUrl.pathname = `/${testDatabase}`;
   const [{ PrismaClient }, { PrismaPg }, { Client }] = await Promise.all([
     import("../../generated/prisma/client.ts"), import("@prisma/adapter-pg"), import("pg"),
   ]);
@@ -58,6 +60,8 @@ test("TB-BE-037/050/051 transaction lifecycle PostgreSQL integration", { skip: !
       await a.transactionTermsDecision.deleteMany({ where: { termsVersion: { transactionId: { in: ids } } } });
       await a.transactionTermsVersion.deleteMany({ where: { transactionId: { in: ids } } });
       await a.paymentAttempt.deleteMany({ where: { transactionId: { in: ids } } });
+      await a.outboxEvent.deleteMany({ where: { transactionId: { in: ids } } });
+      if (userIds.size) await a.notification.deleteMany({ where: { recipientId: { in: [...userIds] } } });
       await a.auditLog.deleteMany({ where: { OR: [{ actorUserId: { in: [...userIds] } }, { entityType: "Transaction", entityId: { in: ids } }] } });
       await a.transactionStatusHistory.deleteMany({ where: { transactionId: { in: ids } } });
       await a.transactionParticipant.deleteMany({ where: { transactionId: { in: ids } } });
@@ -70,12 +74,14 @@ test("TB-BE-037/050/051 transaction lifecycle PostgreSQL integration", { skip: !
   try {
     await a.$connect(); await b.$connect(); await catalog.connect();
     const identity = (await catalog.query("SELECT current_database() AS database,version() AS version,inet_server_addr()::text AS address,inet_server_port() AS port")).rows[0];
-    assert.equal(identity.database, "trustbridge_test");
+    assert.equal(identity.database, testDatabase);
     assert.match(identity.version, /PostgreSQL 17\.10\b/);
     assert.equal(identity.port, 5432);
     assert.ok(["::1/128", "::1", "127.0.0.1/32", "127.0.0.1"].includes(identity.address));
     const status = await a.$queryRaw`SELECT migration_name FROM "_prisma_migrations" WHERE "finished_at" IS NOT NULL AND "rolled_back_at" IS NULL ORDER BY migration_name`;
-    assert.equal(status.length, 10, "isolated DB must have the reviewed terms/invitation migration before writes");
+    const migrationDirectories = (await import("node:fs/promises")).readdir;
+    const migrationNames = (await migrationDirectories("./prisma/migrations", { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    assert.deepEqual(status.map((entry) => entry.migration_name).sort(), migrationNames, "isolated DB must have every current migration applied before writes");
     const [pidA, pidB] = await Promise.all([a.$queryRaw`SELECT pg_backend_pid() AS pid`, b.$queryRaw`SELECT pg_backend_pid() AS pid`]);
     assert.notEqual(pidA[0].pid, pidB[0].pid, "race clients use independent PostgreSQL connections");
 

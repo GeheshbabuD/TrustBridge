@@ -19,6 +19,10 @@ const identifierSchema = z
   .regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/);
 
 const optionalNonEmptyString = z.string().trim().min(1).optional();
+const aiModelIdentifierSchema = z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/);
+const aiEndpointSchema = z.string().trim().url().refine((value) => {
+  try { const url = new URL(value); return ["https:", "http:"].includes(url.protocol) && !url.username && !url.password && !url.hash && !url.search; } catch { return false; }
+});
 
 const durationSeconds = (value) => {
   const match = /^([1-9]\d{0,3})(s|m|h|d|w)$/.exec(value);
@@ -95,6 +99,8 @@ const rpcUrlSchema = z
 const environmentSchema = z
   .object({
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
+    TRUSTBRIDGE_COMPOSITION_MODULE: z.string().trim().min(1).max(512).optional(),
+    SHUTDOWN_DRAIN_TIMEOUT_MS: z.string().regex(/^\d+$/).default("30000").transform(Number).pipe(z.number().int().min(1000).max(300000)),
     PORT: z
       .string()
       .regex(/^\d+$/)
@@ -152,6 +158,12 @@ const environmentSchema = z
     AI_ENABLED: booleanEnvSchema,
     AI_PROVIDER: identifierSchema.optional(),
     AI_API_KEY: optionalNonEmptyString,
+    AI_ENDPOINT: aiEndpointSchema.optional(),
+    AI_MODEL_IDENTIFIER: aiModelIdentifierSchema.optional(),
+    AI_MODEL_VERSION: aiModelIdentifierSchema.optional(),
+    AI_REQUEST_TIMEOUT_MS: z.string().regex(/^\d+$/).default("5000").transform(Number).pipe(z.number().int().min(500).max(30000)),
+    AI_RATE_LIMIT_WINDOW_MS: z.string().regex(/^\d+$/).default("900000").transform(Number).pipe(z.number().int().min(1000).max(3600000)),
+    AI_RATE_LIMIT_MAX: z.string().regex(/^\d+$/).default("10").transform(Number).pipe(z.number().int().min(1).max(100)),
 
     BLOCKCHAIN_ENABLED: booleanEnvSchema,
     BLOCKCHAIN_RPC_URL: rpcUrlSchema.optional(),
@@ -162,12 +174,16 @@ const environmentSchema = z
       .transform(Number)
       .pipe(z.number().int().positive().safe())
       .optional(),
+    BLOCKCHAIN_CONFIRMATIONS: z.string().regex(/^\d+$/).transform(Number).pipe(z.number().int().min(1).max(256)).optional(),
 
     PAYMENT_ENABLED: booleanEnvSchema,
     PAYMENT_PROVIDER: identifierSchema.optional(),
     PAYMENT_API_KEY: optionalNonEmptyString,
     PAYMENT_API_SECRET: optionalNonEmptyString,
     PAYMENT_WEBHOOK_SECRET: z.string().trim().min(16).optional(),
+    ESCROW_EXECUTION_ENABLED: booleanEnvSchema,
+    RAZORPAY_REFUNDS_APPROVED: booleanEnvSchema,
+    RAZORPAY_ROUTE_APPROVED: booleanEnvSchema,
   })
   .superRefine((config, context) => {
     if (config.JWT_ACCESS_SECRET === config.JWT_REFRESH_SECRET) {
@@ -209,11 +225,12 @@ const environmentSchema = z
     }
 
     if (config.AI_ENABLED) {
-      if (!config.AI_PROVIDER) {
-        context.addIssue({ code: "custom", path: ["AI_PROVIDER"] });
+      for (const key of ["AI_PROVIDER", "AI_API_KEY", "AI_ENDPOINT", "AI_MODEL_IDENTIFIER", "AI_MODEL_VERSION"]) {
+        if (!config[key]) context.addIssue({ code: "custom", path: [key] });
       }
-      if (!config.AI_API_KEY) {
-        context.addIssue({ code: "custom", path: ["AI_API_KEY"] });
+      if (config.NODE_ENV === "production" && config.AI_ENDPOINT) {
+        const endpoint = new URL(config.AI_ENDPOINT);
+        if (endpoint.protocol !== "https:") context.addIssue({ code: "custom", path: ["AI_ENDPOINT"] });
       }
     }
 
@@ -223,6 +240,16 @@ const environmentSchema = z
       }
       if (!config.BLOCKCHAIN_CONTRACT_ADDRESS) {
         context.addIssue({ code: "custom", path: ["BLOCKCHAIN_CONTRACT_ADDRESS"] });
+      }
+      if (!config.BLOCKCHAIN_CHAIN_ID) {
+        context.addIssue({ code: "custom", path: ["BLOCKCHAIN_CHAIN_ID"] });
+      }
+      if (!config.BLOCKCHAIN_CONFIRMATIONS) {
+        context.addIssue({ code: "custom", path: ["BLOCKCHAIN_CONFIRMATIONS"] });
+      }
+      if (config.NODE_ENV === "production" && config.BLOCKCHAIN_RPC_URL) {
+        const scheme = new URL(config.BLOCKCHAIN_RPC_URL).protocol;
+        if (!["https:", "wss:"].includes(scheme)) context.addIssue({ code: "custom", path: ["BLOCKCHAIN_RPC_URL"] });
       }
     }
 
@@ -239,6 +266,14 @@ const environmentSchema = z
       if (!config.PAYMENT_WEBHOOK_SECRET) {
         context.addIssue({ code: "custom", path: ["PAYMENT_WEBHOOK_SECRET"] });
       }
+    }
+    if (config.ESCROW_EXECUTION_ENABLED && (!config.PAYMENT_ENABLED || config.PAYMENT_PROVIDER !== "razorpay")) {
+      context.addIssue({ code: "custom", path: ["ESCROW_EXECUTION_ENABLED"] });
+    }
+    if ((config.RAZORPAY_REFUNDS_APPROVED || config.RAZORPAY_ROUTE_APPROVED)
+      && (!config.ESCROW_EXECUTION_ENABLED || !config.PAYMENT_ENABLED || config.PAYMENT_PROVIDER !== "razorpay")) {
+      if (config.RAZORPAY_REFUNDS_APPROVED) context.addIssue({ code: "custom", path: ["RAZORPAY_REFUNDS_APPROVED"] });
+      if (config.RAZORPAY_ROUTE_APPROVED) context.addIssue({ code: "custom", path: ["RAZORPAY_ROUTE_APPROVED"] });
     }
   });
 
@@ -280,12 +315,16 @@ const safeFieldMessages = Object.freeze({
   BLOCKCHAIN_ENABLED: "must be true or false",
   BLOCKCHAIN_RPC_URL: "must use HTTP(S) or WS(S) and is required when BLOCKCHAIN_ENABLED=true",
   BLOCKCHAIN_CONTRACT_ADDRESS: "must be a 20-byte EVM address and is required when BLOCKCHAIN_ENABLED=true",
-  BLOCKCHAIN_CHAIN_ID: "must be a positive safe integer",
+  BLOCKCHAIN_CHAIN_ID: "must be a positive safe integer and is required when BLOCKCHAIN_ENABLED=true",
+  BLOCKCHAIN_CONFIRMATIONS: "must be from 1 through 256 and is required when BLOCKCHAIN_ENABLED=true",
   PAYMENT_ENABLED: "must be true or false",
   PAYMENT_PROVIDER: "must be a valid provider identifier and is required when PAYMENT_ENABLED=true",
   PAYMENT_API_KEY: "must be non-empty and is required when PAYMENT_ENABLED=true",
   PAYMENT_API_SECRET: "must be non-empty and is required when PAYMENT_ENABLED=true",
   PAYMENT_WEBHOOK_SECRET: "must be at least 16 characters and is required when PAYMENT_ENABLED=true",
+  ESCROW_EXECUTION_ENABLED: "requires PAYMENT_ENABLED=true and PAYMENT_PROVIDER=razorpay",
+  RAZORPAY_REFUNDS_APPROVED: "requires explicit escrow execution and Razorpay payment configuration",
+  RAZORPAY_ROUTE_APPROVED: "requires explicit escrow execution and Razorpay payment configuration",
 });
 
 export class EnvironmentConfigError extends Error {
@@ -374,19 +413,23 @@ const makeConfig = (values) => {
     defineSecret(mfa, "localEncryptionKey", Buffer.from(values.MFA_LOCAL_ENCRYPTION_KEY, "base64"));
   }
 
-  const ai = { enabled: values.AI_ENABLED, provider: values.AI_PROVIDER };
+  const ai = { enabled: values.AI_ENABLED, provider: values.AI_PROVIDER, endpoint: values.AI_ENDPOINT, modelIdentifier: values.AI_MODEL_IDENTIFIER, modelVersion: values.AI_MODEL_VERSION, requestTimeoutMs: values.AI_REQUEST_TIMEOUT_MS, rateLimit: Object.freeze({ windowMs: values.AI_RATE_LIMIT_WINDOW_MS, max: values.AI_RATE_LIMIT_MAX }) };
   defineSecret(ai, "apiKey", values.AI_API_KEY);
 
   const blockchain = {
     enabled: values.BLOCKCHAIN_ENABLED,
     contractAddress: values.BLOCKCHAIN_CONTRACT_ADDRESS,
     chainId: values.BLOCKCHAIN_CHAIN_ID,
+    confirmations: values.BLOCKCHAIN_CONFIRMATIONS,
   };
   defineSecret(blockchain, "rpcUrl", values.BLOCKCHAIN_RPC_URL);
 
   const payment = {
     enabled: values.PAYMENT_ENABLED,
     provider: values.PAYMENT_PROVIDER,
+    escrowExecutionEnabled: values.ESCROW_EXECUTION_ENABLED,
+    refundsApproved: values.RAZORPAY_REFUNDS_APPROVED,
+    routeApproved: values.RAZORPAY_ROUTE_APPROVED,
   };
   defineSecret(payment, "apiKey", values.PAYMENT_API_KEY);
   defineSecret(payment, "apiSecret", values.PAYMENT_API_SECRET);
@@ -395,6 +438,8 @@ const makeConfig = (values) => {
   return Object.freeze({
     nodeEnv: values.NODE_ENV,
     port: values.PORT,
+    compositionModule: values.TRUSTBRIDGE_COMPOSITION_MODULE,
+    shutdown: Object.freeze({ drainTimeoutMs: values.SHUTDOWN_DRAIN_TIMEOUT_MS }),
     corsAllowedOrigins: Object.freeze(values.CORS_ALLOWED_ORIGINS),
     rateLimit: Object.freeze(rateLimit),
     password: Object.freeze({ bcryptSaltRounds: values.BCRYPT_SALT_ROUNDS }),

@@ -75,17 +75,17 @@ test("status lookup trusts only a matching captured payment; absence remains pen
 
 test("refund calls use documented idempotency and remain disabled without financial approval", async () => {
   const calls = [];
-  const adapter = createRazorpayPaymentAdapter({ ...options, refundsEnabled: true, authorizeRefund: async () => true, fetchImpl: async (url, init) => { calls.push({ url, init }); return jsonResponse({ id: "rfnd_1", payment_id: "pay_1", amount: 500, status: "pending" }); } });
+  const adapter = createRazorpayPaymentAdapter({ ...options, refundsEnabled: true, authorizeRefund: async () => true, fetchImpl: async (url, init) => { calls.push({ url, init }); return jsonResponse({ id: "rfnd_1", payment_id: "pay_1", amount: 500, currency: "INR", status: "pending" }); } });
   const refund = await adapter.createRefund({ paymentId: "pay_1", amountMinor: "500", idempotencyKey: "refund-key-001", financialContext: { approved: true } });
-  assert.deepEqual(refund, { refundId: "rfnd_1", paymentId: "pay_1", amountMinor: "500", status: "pending" });
+  assert.deepEqual(refund, { refundId: "rfnd_1", paymentId: "pay_1", amountMinor: "500", currency: "INR", status: "pending" });
   assert.equal(calls[0].init.headers["X-Refund-Idempotency"], "refund-key-001");
   const blocked = createRazorpayPaymentAdapter({ ...options, fetchImpl: async () => { throw new Error("must not call"); } });
   await assert.rejects(blocked.createRefund({ paymentId: "pay_1", idempotencyKey: "refund-key-001" }));
 });
 
 test("refund status fetch normalizes provider outcome without mutating payment state", async () => {
-  const adapter = createRazorpayPaymentAdapter({ ...options, fetchImpl: async () => jsonResponse({ id: "rfnd_1", payment_id: "pay_1", status: "processed", amount: 900 }) });
-  assert.deepEqual(await adapter.fetchRefund({ paymentId: "pay_1", refundId: "rfnd_1" }), { refundId: "rfnd_1", paymentId: "pay_1", status: "processed", amountMinor: "900" });
+  const adapter = createRazorpayPaymentAdapter({ ...options, fetchImpl: async () => jsonResponse({ id: "rfnd_1", payment_id: "pay_1", status: "processed", amount: 900, currency: "INR" }) });
+  assert.deepEqual(await adapter.fetchRefund({ paymentId: "pay_1", refundId: "rfnd_1" }), { refundId: "rfnd_1", paymentId: "pay_1", status: "processed", amountMinor: "900", currency: "INR" });
 });
 
 test("Route methods fail closed unless explicitly enabled and independently authorized", async () => {
@@ -95,6 +95,21 @@ test("Route methods fail closed unless explicitly enabled and independently auth
   assert.equal(called, false);
   const adapter = createRazorpayPaymentAdapter({ ...options, routeEnabled: true, authorizeRoute: async () => true, fetchImpl: async () => jsonResponse({ id: "acc_1", type: "route", status: "created" }) });
   assert.deepEqual(await adapter.createRouteLinkedAccount({ payload: {}, financialContext: { approved: true } }), { accountId: "acc_1", status: "created" });
+});
+
+test("Route transfer is tied to the persisted payment and linked account and supports status reconciliation", async () => {
+  const calls = [];
+  const adapter = createRazorpayPaymentAdapter({ ...options, routeEnabled: true, authorizeRoute: async () => true, fetchImpl: async (url, init) => {
+    calls.push({ url, init });
+    if (init.method === "POST") return jsonResponse({ entity: "collection", items: [{ id: "trf_1", recipient: "acc_1", amount: 500, currency: "INR", transfer_status: "created" }] });
+    return jsonResponse({ id: "trf_1", source: "pay_1", recipient: "acc_1", amount: 500, currency: "INR", transfer_status: "processed", settlement_status: "settled" });
+  } });
+  const created = await adapter.createRouteTransfer({ paymentId: "pay_1", accountId: "acc_1", amountMinor: "500", idempotencyKey: "0123456789abcdef0123456789abcdef", financialContext: {} });
+  assert.equal(created.transferId, "trf_1");
+  assert.equal(calls[0].url, "https://api.razorpay.com/v1/payments/pay_1/transfers");
+  assert.equal(JSON.parse(calls[0].init.body).transfers[0].account, "acc_1");
+  const status = await adapter.fetchRouteTransfer({ transferId: "trf_1" });
+  assert.equal(status.status, "processed");
 });
 
 test("timeouts and provider errors are sanitized", async () => {

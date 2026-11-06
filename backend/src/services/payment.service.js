@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from "node:crypto";
 import { getPrismaClient } from "../config/db.js";
 import { getEnv } from "../config/env.js";
 import { ApiError } from "../utils/ApiError.js";
+import { enqueueTransactionNotice } from "./notification-event.service.js";
 import { resolvePaymentAdapter } from "./payment-provider.service.js";
 
 const unavailable = () => new ApiError(503, "PAYMENT_UNAVAILABLE", "Payment service is temporarily unavailable");
@@ -14,6 +15,7 @@ const validNormalizedEvent = (event) => Boolean(event
   && event.providerAccountScope === "default"
   && typeof event.eventType === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(event.eventType)
   && typeof event.providerReference === "string" && event.providerReference.length <= 255 && !/[\u0000-\u001f\u007f]/.test(event.providerReference)
+  && (event.paymentReference === undefined || (typeof event.paymentReference === "string" && /^[A-Za-z0-9_-]{1,80}$/.test(event.paymentReference)))
   && ["PENDING", "CAPTURED", "FAILED", "CANCELLED"].includes(event.outcome)
   && typeof event.amountMinor === "string" && /^[1-9]\d{0,18}$/.test(event.amountMinor)
   && typeof event.currency === "string" && /^[A-Z]{3}$/.test(event.currency));
@@ -62,6 +64,7 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
         await tx.idempotencyOperation.create({ data: { operationScope: scope, idempotencyKey, requestFingerprint: fingerprint, status: "IN_PROGRESS", expiresAt: new Date(stamp.getTime() + 24 * 60 * 60 * 1000) } });
         const attempt = await tx.paymentAttempt.create({ data: { transactionId, provider: providerAdapter.providerId, idempotencyKey, status: "CREATED", amountMinor: transaction.amountMinor, currency: transaction.currency } });
         await tx.outboxEvent.create({ data: { eventKey: `PAYMENT_INTENT:${attempt.id}`, eventType: "PAYMENT_INTENT_CREATE", aggregateType: "PaymentAttempt", aggregateId: attempt.id, transactionId, payload: { attemptId: attempt.id, provider: providerAdapter.providerId }, nextAttemptAt: stamp } });
+        await enqueueTransactionNotice(tx, { transactionId, template: "PAYMENT_STATUS_CHANGED", discriminator: `${attempt.id}:PENDING` });
         await tx.idempotencyOperation.update({ where: { operationScope_idempotencyKey: { operationScope: scope, idempotencyKey } }, data: { status: "COMPLETED", resourceType: "PaymentAttempt", resourceId: attempt.id, completedAt: stamp } });
         await audit(tx, auth.userId, "PAYMENT_ATTEMPT_CREATED", transactionId, requestId, { paymentAttemptId: attempt.id, amountMinor: transaction.amountMinor.toString(), currency: transaction.currency.trim() });
         return { attempt, dispatch: true, idempotent: false };
@@ -156,13 +159,18 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
         const inboxEventId = `checkout:${paymentId}`;
         const inbox = await tx.webhookEvent.create({ data: { provider: current.provider, providerAccountScope: "default", eventId: inboxEventId, eventType: "payment.checkout_verified", paymentAttemptId: current.id, status: "PROCESSED", attemptCount: 1, eventData: { providerReference: orderId, paymentReference: paymentId, outcome: "CAPTURED", amountMinor: current.amountMinor.toString(), currency: current.currency.trim(), source: "SIGNED_CHECKOUT_AND_API_FETCH" }, processedAt: now() } });
         if (["FAILED", "CANCELLED"].includes(current.status)) throw conflict("PAYMENT_EVENT_CONFLICT");
-        const captured = current.status === "CAPTURED" ? current : await tx.paymentAttempt.update({ where: { id: current.id }, data: { status: "CAPTURED", failureCode: null } });
+        if (current.provider === "razorpay" && current.capturedPaymentId && current.capturedPaymentId !== paymentId) throw conflict("PAYMENT_EVENT_MISMATCH");
+        const captured = current.status === "CAPTURED" ? current : await tx.paymentAttempt.update({ where: { id: current.id }, data: { status: "CAPTURED", ...(current.provider === "razorpay" ? { capturedPaymentId: paymentId } : {}), failureCode: null } });
         if (fundingService) await fundingService.recordVerifiedFunding({ tx, paymentAttempt: captured, actorUserId: auth.userId, requestId });
         await audit(tx, auth.userId, "PAYMENT_ATTEMPT_CAPTURE_VERIFIED", current.transactionId, requestId, { paymentAttemptId: current.id, eventId: inbox.eventId, source: "SIGNED_CHECKOUT_AND_API_FETCH" });
         return { paymentAttempt: safeOutcome({ ...current, status: "CAPTURED", updatedAt: now() }), verified: true, captured: true };
       });
     } catch (error) {
-      if (error?.code === "P2002") return { paymentAttempt: safeOutcome({ ...attempt, status: "CAPTURED" }), verified: true, captured: true, duplicate: true };
+      if (error?.code === "P2002") {
+        const persisted = await prisma.paymentAttempt.findUnique({ where: { id: attempt.id } }).catch(() => null);
+        if (persisted?.status === "CAPTURED" && persisted.capturedPaymentId === paymentId) return { paymentAttempt: safeOutcome(persisted), verified: true, captured: true, duplicate: true };
+        throw conflict("PAYMENT_EVENT_MISMATCH");
+      }
       if (error instanceof ApiError) throw error;
       throw unavailable();
     }
@@ -178,6 +186,7 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
     try { result = await providerAdapter.fetchPaymentStatus({ providerReference: pending.providerReference, amountMinor: pending.amountMinor.toString(), currency: pending.currency.trim() }); } catch { throw unavailable(); }
     if (!result || result.verified !== true || result.providerReference !== pending.providerReference
       || !["PENDING", "CAPTURED", "FAILED", "CANCELLED"].includes(result.outcome)
+      || (pending.provider === "razorpay" && result.outcome === "CAPTURED" && (typeof result.paymentReference !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(result.paymentReference)))
       || String(result.amountMinor) !== pending.amountMinor.toString() || result.currency !== pending.currency.trim()
       || (["FAILED", "CANCELLED"].includes(result.outcome) && (result.final !== true || result.noCapture !== true))) throw conflict("PAYMENT_EVENT_UNVERIFIED");
     try {
@@ -193,18 +202,27 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
             await audit(tx, null, "PAYMENT_EVENT_CONFLICT", attempt.transactionId, requestId, { paymentAttemptId: attempt.id, source: "STATUS_LOOKUP", outcome: result.outcome });
             return { status: attempt.status, reconciliationRequired: true };
           }
+          if (attempt.status === "CAPTURED" && attempt.provider === "razorpay") {
+            if (!result.paymentReference || (attempt.capturedPaymentId && attempt.capturedPaymentId !== result.paymentReference)) throw conflict("PAYMENT_EVENT_MISMATCH");
+            if (!attempt.capturedPaymentId) await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { capturedPaymentId: result.paymentReference } });
+          }
           if (result.outcome === "CAPTURED" && fundingService) await fundingService.recordVerifiedFunding({ tx, paymentAttempt: attempt, requestId });
         } else {
-          const updatedAttempt = await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { status: result.outcome, failureCode: result.outcome === "FAILED" ? "PROVIDER_FINAL_FAILURE" : null } });
+          const updatedAttempt = await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { status: result.outcome, ...(result.outcome === "CAPTURED" && attempt.provider === "razorpay" ? { capturedPaymentId: result.paymentReference } : {}), failureCode: result.outcome === "FAILED" ? "PROVIDER_FINAL_FAILURE" : null } });
           if (result.outcome === "CAPTURED" && fundingService) await fundingService.recordVerifiedFunding({ tx, paymentAttempt: updatedAttempt, requestId });
         }
         await tx.webhookEvent.update({ where: { id: event.id }, data: { status: "PROCESSED", processedAt: now() } });
         await audit(tx, null, "PAYMENT_ATTEMPT_RECONCILED", attempt.transactionId, requestId, { paymentAttemptId: attempt.id, status: result.outcome, source: "STATUS_LOOKUP" });
+        await enqueueTransactionNotice(tx, { transactionId: attempt.transactionId, template: "PAYMENT_STATUS_CHANGED", discriminator: `${attempt.id}:${result.outcome}:reconciled` });
         return { status: result.outcome, reconciled: true };
       });
     } catch (error) {
       if (error instanceof ApiError) throw error;
-      if (error?.code === "P2002") return { status: result.outcome, reconciled: true, duplicate: true };
+      if (error?.code === "P2002") {
+        const persisted = await prisma.paymentAttempt.findUnique({ where: { id: pending.id } }).catch(() => null);
+        if (persisted?.status === "CAPTURED" && persisted.capturedPaymentId === result.paymentReference) return { status: "CAPTURED", reconciled: true, duplicate: true };
+        throw conflict("PAYMENT_EVENT_MISMATCH");
+      }
       throw unavailable();
     }
   };
@@ -230,9 +248,14 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
         attempt = await tx.paymentAttempt.findUnique({ where: { id: attempt.id } });
         if (!attempt || attempt.provider !== incomingProvider || attempt.providerReference !== event.providerReference
           || attempt.amountMinor.toString() !== event.amountMinor || attempt.currency.trim() !== event.currency) throw conflict("PAYMENT_EVENT_MISMATCH");
-        const inbox = await tx.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId, eventType: event.eventType, paymentAttemptId: attempt.id, status: "PROCESSING", attemptCount: 1, eventData: { providerReference: event.providerReference, outcome: event.outcome, final: event.final === true, amountMinor: event.amountMinor, currency: event.currency, noCapture: event.noCapture === true, providerOccurredAt: event.providerOccurredAt } } });
+        if (event.outcome === "CAPTURED" && incomingProvider === "razorpay" && !event.paymentReference) throw conflict("PAYMENT_EVENT_MISMATCH");
+        const inbox = await tx.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId, eventType: event.eventType, paymentAttemptId: attempt.id, status: "PROCESSING", attemptCount: 1, eventData: { providerReference: event.providerReference, ...(event.paymentReference ? { paymentReference: event.paymentReference } : {}), outcome: event.outcome, final: event.final === true, amountMinor: event.amountMinor, currency: event.currency, noCapture: event.noCapture === true, providerOccurredAt: event.providerOccurredAt } } });
         if (attempt.status === "CAPTURED" || ["FAILED", "CANCELLED"].includes(attempt.status)) {
           if (attempt.status === event.outcome) {
+            if (attempt.status === "CAPTURED" && attempt.provider === "razorpay") {
+              if (!event.paymentReference || (attempt.capturedPaymentId && attempt.capturedPaymentId !== event.paymentReference)) throw conflict("PAYMENT_EVENT_MISMATCH");
+              if (!attempt.capturedPaymentId) await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { capturedPaymentId: event.paymentReference } });
+            }
             if (event.outcome === "CAPTURED" && fundingService) await fundingService.recordVerifiedFunding({ tx, paymentAttempt: attempt, requestId });
             await tx.webhookEvent.update({ where: { id: inbox.id }, data: { status: "PROCESSED", processedAt: now() } });
             return { accepted: true, duplicate: false };
@@ -248,14 +271,24 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
           return { accepted: true, duplicate: false, reconciliationRequired: true };
         }
         const nextStatus = event.outcome === "PENDING" ? "PENDING" : event.outcome;
-        const updatedAttempt = await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { status: nextStatus, failureCode: nextStatus === "FAILED" ? "PROVIDER_FINAL_FAILURE" : null } });
+        if (event.outcome === "CAPTURED" && attempt.provider === "razorpay" && attempt.capturedPaymentId && attempt.capturedPaymentId !== event.paymentReference) throw conflict("PAYMENT_EVENT_MISMATCH");
+        const updatedAttempt = await tx.paymentAttempt.update({ where: { id: attempt.id }, data: { status: nextStatus, ...(nextStatus === "CAPTURED" && incomingProvider === "razorpay" ? { capturedPaymentId: event.paymentReference } : {}), failureCode: nextStatus === "FAILED" ? "PROVIDER_FINAL_FAILURE" : null } });
         if (nextStatus === "CAPTURED" && fundingService) await fundingService.recordVerifiedFunding({ tx, paymentAttempt: updatedAttempt, requestId });
         await tx.webhookEvent.update({ where: { id: inbox.id }, data: { status: "PROCESSED", processedAt: now() } });
         await audit(tx, null, "PAYMENT_ATTEMPT_STATUS_CHANGED", attempt.transactionId, requestId, { paymentAttemptId: attempt.id, previousStatus: attempt.status, newStatus: nextStatus, eventId: event.eventId, amountMinor: attempt.amountMinor.toString(), currency: attempt.currency.trim() });
+        await enqueueTransactionNotice(tx, { transactionId: attempt.transactionId, template: "PAYMENT_STATUS_CHANGED", discriminator: `${attempt.id}:${nextStatus}:${event.eventId}` });
         return { accepted: true, duplicate: false, status: nextStatus };
       });
     } catch (error) {
-      if (error?.code === "P2002") return { accepted: true, duplicate: true };
+      if (error?.code === "P2002") {
+        const [persistedEvent, persistedAttempt] = await Promise.all([
+          typeof prisma.webhookEvent.findUnique === "function" ? prisma.webhookEvent.findUnique({ where: { provider_providerAccountScope_eventId: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId } } }).catch(() => null) : null,
+          typeof prisma.paymentAttempt.findUnique === "function" ? prisma.paymentAttempt.findUnique({ where: { id: attempt.id } }).catch(() => null) : null,
+        ]);
+        if (persistedEvent) return { accepted: true, duplicate: true };
+        if (event.outcome === "CAPTURED" && persistedAttempt?.status === "CAPTURED" && persistedAttempt.capturedPaymentId === event.paymentReference) return { accepted: true, duplicate: true };
+        throw conflict("PAYMENT_EVENT_MISMATCH");
+      }
       if (error instanceof ApiError) throw error;
       throw unavailable();
     }

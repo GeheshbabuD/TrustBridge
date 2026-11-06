@@ -21,6 +21,7 @@ test("creation writes transaction, both participants, initial history, audit and
     transactionParticipant: { createMany: async ({ data }) => calls.push(["participants", data]) },
     transactionTermsVersion: { create: async ({ data }) => calls.push(["terms.version", data]) },
     transactionStatusHistory: { create: async ({ data }) => calls.push(["history", data]) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async ({ data }) => calls.push(["audit", data]) },
   };
   const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }), fingerprintSecret: "unit-fingerprint-secret" });
@@ -54,6 +55,7 @@ test("only the persisted seller may accept and accepted transitions atomically a
     transactionInvitation: { findFirst: async () => ({ id: "invite-1" }), updateMany: async () => ({ count: 0 }) },
     transactionParticipant: { findUnique: async ({ where }) => ({ role: where.transactionId_userId.userId === sellerId ? "SELLER" : "BUYER" }) },
     transactionStatusHistory: { create: async ({ data }) => events.push(["history", data]) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async ({ data }) => events.push(["audit", data]) },
   };
   const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });
@@ -74,6 +76,7 @@ test("transition requires active current user, participant membership and expect
     user: { findUnique: async () => ({ status: "ACTIVE", authVersion: 0 }) },
     transactionParticipant: { findUnique: async () => ({ role: "SELLER" }) },
     transactionStatusHistory: { create: async () => assert.fail("history must not be created") },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async () => assert.fail("audit must not be written") },
   };
   const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });
@@ -97,6 +100,7 @@ test("awaiting-payment cancellation succeeds only when no payment attempt exists
           return [{ id: "attempt-1", status: attemptStatus, webhookEvents: [] }];
         } },
         transactionStatusHistory: { create: async () => assert.fail("denied cancellation must not write history") },
+        outboxEvent: { create: async () => ({ id: "outbox-test" }) },
         auditLog: { create: async () => assert.fail("denied cancellation must not write audit") },
       };
       const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });
@@ -123,6 +127,7 @@ test("awaiting-payment cancellation succeeds only when no payment attempt exists
       transactionParticipant: { findUnique: async () => ({ role: "BUYER" }) },
       paymentAttempt: { findMany: async () => [] },
       transactionStatusHistory: { create: async ({ data }) => writes.push(["history", data]) },
+      outboxEvent: { create: async () => ({ id: "outbox-test" }) },
       auditLog: { create: async ({ data }) => writes.push(["audit", data]) },
     };
     const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });
@@ -148,6 +153,7 @@ test("payment, escrow, dispute and settlement transitions fail closed pending th
       user: { findUnique: async () => ({ status: "ACTIVE", authVersion: 0 }) },
       transactionParticipant: { findUnique: async () => ({ role: "BUYER" }) },
       transactionStatusHistory: { create: async () => assert.fail("unsupported transition must not append history") },
+      outboxEvent: { create: async () => ({ id: "outbox-test" }) },
       auditLog: { create: async () => assert.fail("unsupported transition must not append audit") },
     };
     const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });
@@ -187,6 +193,7 @@ test("awaiting-payment cancellation accepts only a processed verified no-capture
     transactionStatusHistory: { create: async () => {} },
     transactionInvitation: { updateMany: async () => ({ count: 0 }) },
     transactionTermsVersion: { updateMany: async () => ({ count: 0 }) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async () => {} },
   };
   const service = createTransactionService({ getClient: async () => ({ $transaction: (fn) => fn(tx) }) });

@@ -63,6 +63,7 @@ const makeFixture = ({ status = "ACCEPTED", versionStatus = "LEGACY_ACCEPTED", d
     },
     paymentAttempt: { findFirst: async () => null }, escrow: { findFirst: async () => null }, dispute: { findFirst: async () => null },
     transactionStatusHistory: { create: async ({ data }) => { db.history.push(data); return data; } },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async ({ data }) => { db.audits.push(data); return data; } },
   };
   const root = { ...tx, $transaction: async (callback) => callback(tx) };

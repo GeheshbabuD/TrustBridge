@@ -4,6 +4,9 @@ import { createUserRouter } from "./user.routes.js";
 import { createTransactionRouter } from "./transaction.routes.js";
 import { createPaymentRouter } from "./payment.routes.js";
 import { createEscrowRouter } from "./escrow.routes.js";
+import { createDisputeRouter } from "./dispute.routes.js";
+import { createAiRouter } from "./ai.routes.js";
+import { createNotificationRouter } from "./notification.routes.js";
 
 export const registerApiRoutes = (app, dependencies = {}) => {
   const apiV1Router = Router();
@@ -12,5 +15,8 @@ export const registerApiRoutes = (app, dependencies = {}) => {
   apiV1Router.use(createTransactionRouter(dependencies));
   apiV1Router.use(createPaymentRouter(dependencies));
   apiV1Router.use(createEscrowRouter(dependencies));
+  apiV1Router.use(createDisputeRouter(dependencies));
+  apiV1Router.use(createAiRouter(dependencies));
+  apiV1Router.use(createNotificationRouter(dependencies));
   app.use("/api/v1", apiV1Router);
 };

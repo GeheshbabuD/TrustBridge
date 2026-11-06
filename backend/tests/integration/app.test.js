@@ -10,14 +10,36 @@ process.env.JWT_ACCESS_SECRET = "test-access-secret-value-with-enough-entropy-12
 process.env.JWT_REFRESH_SECRET = "test-refresh-secret-value-with-enough-entropy-456";
 process.env.CORS_ALLOWED_ORIGINS = "https://frontend.example.test";
 
-const { default: app } = await import("../../src/app.js");
-const { createApp } = await import("../../src/app.js");
+const { default: app, createApp } = await import("../../src/app.js");
 const { startServer } = await import("../../src/server.js");
 const { getEnv, validateEnv } = await import("../../src/config/env.js");
 const { errorHandler } = await import("../../src/middleware/error.middleware.js");
 const { ApiError } = await import("../../src/utils/ApiError.js");
 
-const testApp = createApp(getEnv(), { writeLog: () => {} });
+const productionEnvironment = () => validateEnv({
+  DATABASE_URL: "postgresql://test:test@localhost:5432/trustbridge_test",
+  NODE_ENV: "production",
+  JWT_ACCESS_SECRET: "production-access-secret-test-value-123456789",
+  JWT_REFRESH_SECRET: "production-refresh-secret-test-value-987654321",
+  RATE_LIMIT_STORE: "redis",
+  REDIS_URL: "rediss://acl-user:synthetic-password@redis.example.test:6380/0",
+  RATE_LIMIT_KEY_SECRET: "separate-production-rate-limit-key-123456789",
+  MFA_ENCRYPTION_PROVIDER: "kms",
+  MFA_KMS_KEY_ID: "test-kms-key",
+  MFA_KMS_KEY_VERSION: "1",
+});
+
+const testApp = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => { throw new Error("database probe unavailable"); } });
+const defaultWorkerStatus = {
+  notification: { state: "stopped", consecutiveFailures: 0, lastSuccessAt: null, lastFailureAt: null, lastErrorCode: null },
+  escrow: { state: "disabled" },
+  blockchain: { state: "disabled" },
+};
+test("configured blockchain execution fails closed without an approved signer adapter", () => {
+  const environment = getEnv();
+  const enabled = { ...environment, integrations: { ...environment.integrations, blockchain: { enabled: true, chainId: 1337, confirmations: 1, contractAddress: "0x1234567890abcdef1234567890abcdef12345678" } } };
+  assert.throws(() => createApp(enabled), /no approved signing adapter is configured/);
+});
 const withHttpServer = async (run, targetApp = testApp) => {
   const server = targetApp.listen(0);
   await once(server, "listening");
@@ -40,7 +62,9 @@ test("Express application can be imported without opening a listener", () => {
 
 test("server bootstrap can start and close gracefully on an ephemeral port", async () => {
   const shutdownOrder = [];
+  const bootstrapApp = Object.assign((_request, response) => response.end(), { locals: {} });
   const { server, shutdown } = startServer(0, {
+    appInstance: bootstrapApp,
     disconnectDatabase: async () => {
       assert.equal(server.listening, false);
       shutdownOrder.push("database");
@@ -70,7 +94,7 @@ test("health endpoint returns the expected application status", async () => {
   });
 });
 
-test("liveness reports the process while readiness includes rate-limit store availability", async () => {
+test("liveness reports the process while readiness reports database and rate-limit dependencies", async () => {
   await withHttpServer(async (baseUrl) => {
     const live = await fetch(`${baseUrl}/health/live`);
     assert.equal(live.status, 200);
@@ -86,7 +110,7 @@ test("liveness reports the process while readiness includes rate-limit store ava
     assert.deepEqual(payload, {
       success: false,
       message: "Application readiness cannot be confirmed",
-      data: { status: "not_ready", checks: { database: "not_checked", rateLimitStore: "process_local", mfaEncryption: "not_required" } },
+      data: { status: "not_ready", checks: { database: "unavailable", rateLimitStore: "process_local", mfaEncryption: "not_required" }, lifecycle: "unmanaged", workers: defaultWorkerStatus },
       error: { code: "READINESS_UNAVAILABLE" },
       requestId: ready.headers.get("x-request-id"),
     });
@@ -95,21 +119,25 @@ test("liveness reports the process while readiness includes rate-limit store ava
   });
 });
 
+test("readiness succeeds when database and required local-environment dependencies are available", async () => {
+  const readyApp = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => true });
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/health/ready`);
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).data, {
+      status: "ready",
+      checks: { database: "available", rateLimitStore: "process_local", mfaEncryption: "not_required" },
+      lifecycle: "unmanaged",
+      workers: defaultWorkerStatus,
+    });
+  }, readyApp);
+});
+
 test("production readiness reports KMS unavailable without exposing provider details", async () => {
-  const production = validateEnv({
-    DATABASE_URL: "postgresql://test:test@localhost:5432/trustbridge_test",
-    NODE_ENV: "production",
-    JWT_ACCESS_SECRET: "production-access-secret-test-value-123456789",
-    JWT_REFRESH_SECRET: "production-refresh-secret-test-value-987654321",
-    RATE_LIMIT_STORE: "redis",
-    REDIS_URL: "rediss://acl-user:synthetic-password@redis.example.test:6380/0",
-    RATE_LIMIT_KEY_SECRET: "separate-production-rate-limit-key-123456789",
-    MFA_ENCRYPTION_PROVIDER: "kms",
-    MFA_KMS_KEY_ID: "test-kms-key",
-    MFA_KMS_KEY_VERSION: "1",
-  });
+  const production = productionEnvironment();
   const readyApp = createApp(production, {
     writeLog: () => {},
+    checkDatabase: async () => true,
     mfaService: { checkEncryptionAvailability: async () => { throw new Error("private KMS endpoint detail"); } },
     rateLimitStore: { shared: true, increment: async () => ({ count: 1 }), healthCheck: async () => ({ available: true, shared: true }) },
   });
@@ -122,6 +150,43 @@ test("production readiness reports KMS unavailable without exposing provider det
   }, readyApp);
 });
 
+test("production readiness rejects unavailable shared Redis", async () => {
+  const production = productionEnvironment();
+  const readyApp = createApp(production, {
+    writeLog: () => {},
+    checkDatabase: async () => true,
+    mfaService: { checkEncryptionAvailability: async () => true },
+    rateLimitStore: { shared: true, increment: async () => ({ count: 1 }), healthCheck: async () => ({ available: false, shared: true }) },
+  });
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/health/ready`);
+    const payload = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(payload.data.checks.rateLimitStore, "unavailable");
+    assert.doesNotMatch(JSON.stringify(payload), /synthetic-password|redis\.example/);
+  }, readyApp);
+});
+
+test("production readiness succeeds only when database, Redis and KMS are available", async () => {
+  const production = productionEnvironment();
+  const readyApp = createApp(production, {
+    writeLog: () => {},
+    checkDatabase: async () => true,
+    mfaService: { checkEncryptionAvailability: async () => true },
+    rateLimitStore: { shared: true, increment: async () => ({ count: 1 }), healthCheck: async () => ({ available: true, shared: true }) },
+  });
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/health/ready`);
+    assert.equal(response.status, 200);
+    assert.deepEqual((await response.json()).data, {
+      status: "ready",
+      checks: { database: "available", rateLimitStore: "available", mfaEncryption: "available" },
+      lifecycle: "unmanaged",
+      workers: defaultWorkerStatus,
+    });
+  }, readyApp);
+});
+
 test("shared rate-limit storage outages fail API requests closed and appear in readiness", async () => {
   const unavailableStore = {
     kind: "redis",
@@ -129,7 +194,7 @@ test("shared rate-limit storage outages fail API requests closed and appear in r
     increment: async () => { throw new Error("synthetic storage outage"); },
     healthCheck: async () => ({ available: false, shared: true }),
   };
-  const failingApp = createApp(getEnv(), { writeLog: () => {}, rateLimitStore: unavailableStore });
+  const failingApp = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => true, rateLimitStore: unavailableStore });
   await withHttpServer(async (baseUrl) => {
     const response = await fetch(`${baseUrl}/api/v1/auth/login`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(response.status, 503);
@@ -299,7 +364,7 @@ test("API rate limits return a consistent response while health remains availabl
     JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET,
     API_RATE_LIMIT_MAX: "1",
   });
-  const strictApp = createApp(strictEnvironment, { writeLog: () => {} });
+  const strictApp = createApp(strictEnvironment, { writeLog: () => {}, checkDatabase: async () => { throw new Error("database probe unavailable"); } });
 
   await withHttpServer(async (baseUrl) => {
     assert.equal((await fetch(`${baseUrl}/health`)).status, 200);

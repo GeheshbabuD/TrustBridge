@@ -81,6 +81,22 @@ const purposeDefinitions = {
     additionalAuthorizationRequired: true,
     oneTime: true,
   }),
+  DISPUTE_REVIEW: Object.freeze({
+    resourceType: "DISPUTE",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
+  DISPUTE_RESOLUTION: Object.freeze({
+    resourceType: "DISPUTE",
+    resourceRequired: true,
+    allowedRoles: Object.freeze(["ADMIN"]),
+    maxAgeSeconds: 300,
+    additionalAuthorizationRequired: true,
+    oneTime: true,
+  }),
 };
 
 export const STEP_UP_PURPOSES = Object.freeze(purposeDefinitions);

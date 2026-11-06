@@ -116,7 +116,7 @@ export const createRazorpayPaymentAdapter = ({
       }
       if (typeof eventId !== "string" || !providerReference || !identifier.test(providerReference)
         || !Number.isSafeInteger(amount) || amount < 1 || currency !== "INR") return null;
-      return { eventId, providerAccountScope: "default", eventType, providerReference, outcome,
+      return { eventId, providerAccountScope: "default", eventType, providerReference, ...(payment?.id && identifier.test(payment.id) ? { paymentReference: payment.id } : {}), outcome,
         amountMinor: String(amount), currency, final: false, noCapture: false,
         providerOccurredAt: Number.isSafeInteger(body.created_at) ? new Date(body.created_at * 1000).toISOString() : null };
     },
@@ -128,7 +128,7 @@ export const createRazorpayPaymentAdapter = ({
       if (captured.length > 1) throw safeError();
       if (captured.length === 1) {
         const payment = captured[0];
-        return { verified: true, providerReference, outcome: "CAPTURED", amountMinor: String(payment.amount), currency: payment.currency, final: false, noCapture: false };
+        return { verified: true, providerReference, paymentReference: payment.id, outcome: "CAPTURED", amountMinor: String(payment.amount), currency: payment.currency, final: false, noCapture: false };
       }
       return { verified: true, providerReference, outcome: "PENDING", amountMinor: String(amountMinor), currency, final: false, noCapture: false };
     },
@@ -140,14 +140,15 @@ export const createRazorpayPaymentAdapter = ({
       const data = await request(`/v1/payments/${encodeURIComponent(paymentId)}/refund`, { method: "POST", headers: { "X-Refund-Idempotency": idempotencyKey }, body: amount === undefined ? {} : { amount } });
       if (typeof data.id !== "string" || !identifier.test(data.id) || data.payment_id !== paymentId
         || !Number.isSafeInteger(data.amount) || data.amount < 1 || (amount !== undefined && data.amount !== amount)
+        || data.currency !== "INR"
         || !["pending", "processed", "failed"].includes(data.status)) throw safeError();
-      return { refundId: data.id, paymentId, amountMinor: String(data.amount), status: data.status };
+      return { refundId: data.id, paymentId, amountMinor: String(data.amount), currency: data.currency, status: data.status };
     },
     async fetchRefund({ paymentId, refundId }) {
       if (!identifier.test(paymentId ?? "") || !identifier.test(refundId ?? "")) throw safeError();
       const data = await request(`/v1/payments/${encodeURIComponent(paymentId)}/refunds/${encodeURIComponent(refundId)}`);
-      if (data.id !== refundId || data.payment_id !== paymentId || !["pending", "processed", "failed"].includes(data.status)) throw safeError();
-      return { refundId, paymentId, status: data.status, amountMinor: String(data.amount) };
+      if (data.id !== refundId || data.payment_id !== paymentId || data.currency !== "INR" || !Number.isSafeInteger(data.amount) || data.amount < 1 || !["pending", "processed", "failed"].includes(data.status)) throw safeError();
+      return { refundId, paymentId, status: data.status, amountMinor: String(data.amount), currency: data.currency };
     },
     async createRouteLinkedAccount({ payload, financialContext }) {
       await requireRouteAuthorization("ROUTE_LINKED_ACCOUNT", financialContext);
@@ -156,13 +157,24 @@ export const createRazorpayPaymentAdapter = ({
       if (typeof data.id !== "string" || !identifier.test(data.id) || data.type !== "route") throw safeError();
       return { accountId: data.id, status: data.status };
     },
-    async createRouteTransfer({ accountId, amountMinor, idempotencyKey, financialContext }) {
+    async createRouteTransfer({ paymentId, accountId, amountMinor, idempotencyKey, financialContext }) {
       await requireRouteAuthorization("ROUTE_TRANSFER", financialContext);
       const amount = safeMinor(amountMinor);
-      if (!identifier.test(accountId ?? "") || amount === null || !/^[A-Za-z0-9_-]{4,36}$/.test(idempotencyKey ?? "")) throw safeError();
-      const data = await request("/v1/transfers", { method: "POST", headers: { "X-Transfer-Idempotency": idempotencyKey }, body: { account: accountId, amount, currency: "INR" } });
-      if (typeof data.id !== "string" || !identifier.test(data.id)) throw safeError();
-      return { transferId: data.id, status: data.status };
+      if (!identifier.test(paymentId ?? "") || !identifier.test(accountId ?? "") || amount === null || !/^[A-Za-z0-9_-]{4,36}$/.test(idempotencyKey ?? "")) throw safeError();
+      const data = await request(`/v1/payments/${encodeURIComponent(paymentId)}/transfers`, { method: "POST", headers: { "X-Transfer-Idempotency": idempotencyKey }, body: { transfers: [{ account: accountId, amount, currency: "INR" }] } });
+      const transfer = data.items?.length === 1 ? data.items[0] : data;
+      if (typeof transfer.id !== "string" || !identifier.test(transfer.id) || (transfer.recipient && transfer.recipient !== accountId)
+        || (transfer.amount !== undefined && transfer.amount !== amount) || (transfer.currency !== undefined && transfer.currency !== "INR")) throw safeError();
+      return { transferId: transfer.id, paymentId, accountId, amountMinor: String(amount), currency: "INR", status: transfer.transfer_status ?? transfer.status ?? "created" };
+    },
+    async fetchRouteTransfer({ transferId }) {
+      if (!identifier.test(transferId ?? "")) throw safeError();
+      const data = await request(`/v1/transfers/${encodeURIComponent(transferId)}`);
+      const status = data.transfer_status ?? data.status;
+      if (data.id !== transferId || !identifier.test(data.recipient ?? "") || !identifier.test(data.source ?? "") || !Number.isSafeInteger(data.amount) || data.amount < 1
+        || data.currency !== "INR" || !["created", "pending", "processed", "failed", "reversed", "partially_reversed"].includes(status)
+        || !["pending", "on_hold", "settled"].includes(data.settlement_status)) throw safeError();
+      return { transferId, accountId: data.recipient, paymentId: data.source, amountMinor: String(data.amount), currency: data.currency, settlementStatus: data.settlement_status, onHold: data.on_hold === true, status };
     },
     async setRouteTransferHold({ transferId, onHold, onHoldUntil, financialContext }) {
       await requireRouteAuthorization("ROUTE_TRANSFER_HOLD", financialContext);

@@ -19,6 +19,7 @@ const fundingFixture = () => {
     ledgerJournal: { create: async ({ data }) => { calls.push(["journal", data]); return { id: "journal-1" }; } },
     ledgerEntry: { createMany: async ({ data }) => { calls.push(["entries", data]); return { count: data.length }; } },
     transactionStatusHistory: { create: async ({ data }) => calls.push(["history", data]) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async ({ data }) => calls.push(["audit", data]) },
   };
   return { tx, calls, transaction };
@@ -68,7 +69,9 @@ test("verified mocked release posts the balancing journal and finalizes escrow o
     ledgerEntry: { createMany: async ({ data }) => writes.push(["entries", data]) },
     transaction: { findUnique: async () => ({ id: "tx-2", status: "RELEASE_PENDING", version: 4 }), updateMany: async ({ data }) => { writes.push(["transaction", data]); return { count: 1 }; } },
     transactionStatusHistory: { create: async ({ data }) => writes.push(["history", data]) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
     auditLog: { create: async ({ data }) => writes.push(["audit", data]) },
+    dispute: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
   };
   const client = { escrowOperation: { findUnique: async () => ({ ...operation, attemptCount: 0, transaction: { status: "RELEASE_PENDING" } }), updateMany: async () => ({ count: 1 }) }, $transaction: (callback) => callback(tx) };
   const service = createEscrowService({ getClient: async () => client, releaseExecutor: async () => ({ verified: true, outcome: "SUCCEEDED", provider: "mock", providerReference: "payout-ref", amountMinor: "9000", currency: "INR" }) });
@@ -80,6 +83,30 @@ test("verified mocked release posts the balancing journal and finalizes escrow o
   assert.equal(entries[0].amountMinor, entries[1].amountMinor);
   assert.equal(entries[0].direction, "DEBIT");
   assert.equal(entries[1].direction, "CREDIT");
+});
+
+test("verified partial refund posts only the adjudicated amount and retains funded escrow balance", async () => {
+  const writes = [];
+  const operation = { id: "op-partial", transactionId: "tx-partial", escrowId: "esc-partial", type: "REFUND", status: "PENDING", amountMinor: 2500n, currency: "INR", reasonCode: "ADMIN_RESOLVED_PARTIAL_REFUND", operationKey: "REFUND:op-partial" };
+  const tx = {
+    $queryRaw: async () => [],
+    escrowOperation: { findUnique: async () => operation, updateMany: async ({ data }) => { writes.push(["operation", data]); return { count: 1 }; } },
+    escrow: { findUnique: async () => ({ id: "esc-partial", status: "REFUND_PENDING", balanceMinor: 9000n }), update: async ({ data }) => writes.push(["escrow", data]) },
+    ledgerAccount: { upsert: async ({ create }) => ({ id: create.accountCode }) },
+    ledgerJournal: { create: async ({ data }) => { writes.push(["journal", data]); return { id: "journal-partial" }; } },
+    ledgerEntry: { createMany: async ({ data }) => writes.push(["entries", data]) },
+    transaction: { findUnique: async () => ({ id: "tx-partial", status: "REFUND_PENDING", version: 8 }), updateMany: async ({ data }) => { writes.push(["transaction", data]); return { count: 1 }; } },
+    transactionStatusHistory: { create: async ({ data }) => writes.push(["history", data]) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
+    auditLog: { create: async ({ data }) => writes.push(["audit", data]) },
+  };
+  const client = { escrowOperation: { findUnique: async () => ({ ...operation, attemptCount: 0, transaction: { status: "REFUND_PENDING" } }), updateMany: async () => ({ count: 1 }) }, $transaction: (callback) => callback(tx) };
+  const service = createEscrowService({ getClient: async () => client, refundExecutor: async () => ({ verified: true, outcome: "SUCCEEDED", provider: "mock", providerReference: "refund-partial", amountMinor: "2500", currency: "INR" }) });
+  assert.deepEqual(await service.executeAuthorizedOperation({ operationId: operation.id }), { status: "SUCCEEDED", ledgerJournalId: "journal-partial" });
+  assert.equal(writes.find(([key]) => key === "entries")[1][0].amountMinor, 2500n);
+  assert.equal(writes.find(([key]) => key === "escrow")[1].status, "FUNDED");
+  assert.equal(writes.find(([key]) => key === "escrow")[1].balanceMinor, 6500n);
+  assert.equal(writes.find(([key]) => key === "transaction")[1].status, "DELIVERED");
 });
 
 test("ledger migration is additive and declares immutable, deferred balanced-journal enforcement", async () => {
@@ -116,4 +143,54 @@ test("execution lease migration is additive and supports bounded retry claims", 
   assert.match(sql, /ADD COLUMN "lease_expires_at"/);
   assert.match(sql, /attempt_count_nonnegative_check/);
   assert.doesNotMatch(sql, /\b(DROP|TRUNCATE|DELETE FROM)\b/i);
+});
+
+test("escrow outbox worker uses the operation lease and reschedules ambiguous provider outcomes with persisted reference", async () => {
+  const outboxUpdates = []; const operationUpdates = [];
+  const operation = { id: "op-worker", transactionId: "tx-worker", escrowId: "esc-worker", type: "REFUND", status: "PENDING", amountMinor: 3000n, currency: "INR", operationKey: "REFUND:tx-worker:hash", attemptCount: 0, providerReference: null };
+  const client = {
+    outboxEvent: {
+      findMany: async () => [{ id: "event-1", eventKey: "ESCROW_OPERATION:op-worker", payload: { operationId: "op-worker" } }],
+      updateMany: async (args) => { outboxUpdates.push(args); return { count: 1 }; },
+    },
+    escrowOperation: {
+      findUnique: async () => ({ ...operation, transaction: { status: "REFUND_PENDING" } }),
+      updateMany: async (args) => { operationUpdates.push(args); return { count: 1 }; },
+    },
+  };
+  const service = createEscrowService({ getClient: async () => client, refundExecutor: async ({ persistProviderReference }) => {
+    await persistProviderReference({ provider: "razorpay", providerReference: "rfnd_1" });
+    return { verified: false, outcome: "PENDING", provider: "razorpay", providerReference: "rfnd_1" };
+  } });
+  assert.deepEqual(await service.processOutboxBatch(), { claimed: 1, processed: 0, deferred: 1 });
+  assert.equal(operationUpdates.length, 3); // claim, durable provider ID, lease release
+  assert.equal(operationUpdates[1].data.providerReference, "rfnd_1");
+  assert.equal(operationUpdates[1].data.status, undefined);
+  assert.equal(outboxUpdates.at(-1).data.status, "PENDING");
+});
+
+test("authoritative terminal provider failure restores the funded pre-operation state without posting a journal", async () => {
+  const operation = { id: "op-failed", transactionId: "tx-failed", escrowId: "esc-failed", type: "RELEASE", status: "PENDING", amountMinor: 3000n, currency: "INR", operationKey: "RELEASE:tx-failed:key", attemptCount: 0, providerReference: null, leaseOwner: null };
+  const writes = [];
+  const conditionalUpdate = async ({ where, data }) => {
+    if (where.id !== operation.id || operation.status !== "PENDING" || (where.leaseOwner && operation.leaseOwner !== where.leaseOwner)) return { count: 0 };
+    Object.assign(operation, data); writes.push(data); return { count: 1 };
+  };
+  const tx = {
+    $queryRaw: async () => [],
+    escrowOperation: { findUnique: async () => operation, updateMany: conditionalUpdate },
+    escrow: { findUnique: async () => ({ id: operation.escrowId, status: "RELEASE_PENDING", balanceMinor: 3000n }), update: async ({ data }) => writes.push({ escrow: data }) },
+    transaction: { findUnique: async () => ({ id: operation.transactionId, status: "RELEASE_PENDING", version: 8 }), updateMany: async ({ data }) => { writes.push({ transaction: data }); return { count: 1 }; } },
+    transactionStatusHistory: { create: async ({ data }) => writes.push({ history: data }) },
+    outboxEvent: { create: async () => ({ id: "outbox-test" }) },
+    auditLog: { create: async ({ data }) => writes.push({ audit: data }) },
+  };
+  const client = { escrowOperation: { findUnique: async () => ({ ...operation, transaction: {} }), updateMany: conditionalUpdate }, $transaction: async (callback) => callback(tx) };
+  const service = createEscrowService({ getClient: async () => client, releaseExecutor: async () => ({ verified: true, outcome: "FAILED", final: true, provider: "razorpay", providerReference: "trf_failed", amountMinor: "3000", currency: "INR" }) });
+  assert.deepEqual(await service.executeAuthorizedOperation({ operationId: operation.id }), { status: "FAILED", providerReference: "trf_failed" });
+  assert.equal(operation.status, "FAILED");
+  assert.equal(operation.providerReference, "trf_failed");
+  assert.ok(writes.some((write) => write.escrow?.status === "FUNDED"));
+  assert.ok(writes.some((write) => write.transaction?.status === "DELIVERED"));
+  assert.equal(writes.some((write) => Object.hasOwn(write, "journalId")), false);
 });

@@ -29,6 +29,27 @@ test("validates required values and applies development defaults", () => {
   assert.equal(config.jwt.accessTtl, "15m");
   assert.equal(config.jwt.refreshTtl, "7d");
   assert.equal(config.jwt.algorithm, "HS256");
+  assert.equal(config.integrations.payment.escrowExecutionEnabled, false);
+  assert.equal(config.integrations.payment.refundsApproved, false);
+  assert.equal(config.integrations.payment.routeApproved, false);
+});
+
+test("financial execution requires explicit Razorpay configuration and defaults disabled", () => {
+  const approved = validateEnv({
+    ...validEnvironment,
+    PAYMENT_ENABLED: "true", PAYMENT_PROVIDER: "razorpay", PAYMENT_API_KEY: "synthetic-key",
+    PAYMENT_API_SECRET: "synthetic-secret", PAYMENT_WEBHOOK_SECRET: "synthetic-webhook-secret-012345",
+    ESCROW_EXECUTION_ENABLED: "true", RAZORPAY_REFUNDS_APPROVED: "true", RAZORPAY_ROUTE_APPROVED: "true",
+  });
+  assert.deepEqual(approved.integrations.payment, {
+    enabled: true, provider: "razorpay", escrowExecutionEnabled: true, refundsApproved: true, routeApproved: true,
+  });
+  for (const environment of [
+    { ...validEnvironment, ESCROW_EXECUTION_ENABLED: "true" },
+    { ...validEnvironment, RAZORPAY_REFUNDS_APPROVED: "true" },
+    { ...validEnvironment, RAZORPAY_ROUTE_APPROVED: "true" },
+    { ...validEnvironment, PAYMENT_ENABLED: "true", PAYMENT_PROVIDER: "mock" },
+  ]) assert.throws(() => validateEnv(environment), EnvironmentConfigError);
 });
 
 test("rejects missing required environment variables with field names", () => {
@@ -255,11 +276,11 @@ test("MFA verification failures have bounded rate-limit configuration", () => {
 test("requires credentials and endpoint details only when an integration is enabled", () => {
   assert.throws(
     () => validateEnv({ ...validEnvironment, AI_ENABLED: "true" }),
-    /AI_PROVIDER.*AI_API_KEY/s,
+    /AI_PROVIDER.*AI_API_KEY.*AI_ENDPOINT.*AI_MODEL_IDENTIFIER.*AI_MODEL_VERSION/s,
   );
   assert.throws(
     () => validateEnv({ ...validEnvironment, BLOCKCHAIN_ENABLED: "true" }),
-    /BLOCKCHAIN_RPC_URL.*BLOCKCHAIN_CONTRACT_ADDRESS/s,
+    /BLOCKCHAIN_RPC_URL.*BLOCKCHAIN_CONTRACT_ADDRESS.*BLOCKCHAIN_CHAIN_ID.*BLOCKCHAIN_CONFIRMATIONS/s,
   );
   assert.throws(
     () => validateEnv({ ...validEnvironment, PAYMENT_ENABLED: "true" }),
@@ -273,10 +294,14 @@ test("accepts complete optional provider configuration", () => {
     AI_ENABLED: "true",
     AI_PROVIDER: "example-ai",
     AI_API_KEY: "ai-provider-secret",
+    AI_ENDPOINT: "https://ai-gateway.example.test/v1/assess",
+    AI_MODEL_IDENTIFIER: "risk-model",
+    AI_MODEL_VERSION: "2026-01",
     BLOCKCHAIN_ENABLED: "true",
     BLOCKCHAIN_RPC_URL: "https://rpc.example.invalid",
     BLOCKCHAIN_CONTRACT_ADDRESS: "0x1234567890abcdef1234567890abcdef12345678",
     BLOCKCHAIN_CHAIN_ID: "11155111",
+    BLOCKCHAIN_CONFIRMATIONS: "12",
     PAYMENT_ENABLED: "true",
     PAYMENT_PROVIDER: "example-payments",
     PAYMENT_API_KEY: "payment-key",
@@ -286,8 +311,23 @@ test("accepts complete optional provider configuration", () => {
 
   assert.equal(config.integrations.ai.enabled, true);
   assert.equal(config.integrations.ai.apiKey, "ai-provider-secret");
+  assert.equal(config.integrations.ai.modelIdentifier, "risk-model");
+  assert.equal(config.integrations.ai.rateLimit.max, 10);
   assert.equal(config.integrations.blockchain.chainId, 11155111);
+  assert.equal(config.integrations.blockchain.confirmations, 12);
   assert.equal(config.integrations.payment.enabled, true);
+});
+
+test("enabled production blockchain RPC requires TLS", () => {
+  expectConfigError({
+    ...validEnvironment,
+    NODE_ENV: "production",
+    BLOCKCHAIN_ENABLED: "true",
+    BLOCKCHAIN_RPC_URL: "http://rpc.example.invalid",
+    BLOCKCHAIN_CONTRACT_ADDRESS: "0x1234567890abcdef1234567890abcdef12345678",
+    BLOCKCHAIN_CHAIN_ID: "11155111",
+    BLOCKCHAIN_CONFIRMATIONS: "12",
+  });
 });
 
 test("validation errors and serialized config do not disclose secret values or log them", () => {
