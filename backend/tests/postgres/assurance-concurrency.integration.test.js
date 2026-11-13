@@ -363,6 +363,43 @@ test("PostgreSQL assurance and MFA concurrency integration", { skip: !enabled },
       assert.equal(updated.consumedAt.getTime(), verifiedAt.getTime());
       assert.ok(updated.grantConsumedAt instanceof Date);
       assert.equal(await a.mfaChallenge.count({ where: { id: grant.id, grantConsumedAt: { not: null } } }), 1);
+      const replayError = await new Promise((resolve) => createStepUpAuthorizationMiddleware({
+        purpose: "MFA_RECOVERY_CODES_REGENERATE", resourceId: user.id, purposeRegistry: DEFAULT_STEP_UP_PURPOSES,
+        getClient: async () => a, now,
+      })({ auth, params: {} }, {}, (error) => resolve(error ?? null)));
+      assert.equal(replayError.code, "MFA_ASSURANCE_REQUIRED");
+      assert.equal((await a.mfaChallenge.findUnique({ where: { id: grant.id } })).grantConsumedAt.getTime(), updated.grantConsumedAt.getTime());
+    });
+
+    await t.test("expired, wrong-purpose and wrong-resource grants are rejected without consumption", async () => {
+      const user = await createUser({ mfa: true });
+      const issuedAt = new Date();
+      await sessionsFor(a).issueForUser(user.id, { mfaVerifiedAt: issuedAt, expectedAuthVersion: 0 });
+      const sessionId = (await a.refreshToken.findFirst({ where: { userId: user.id }, select: { id: true } })).id;
+      const recent = new Date();
+      const stale = new Date(recent.getTime() - 6 * 60_000);
+      const grants = await Promise.all([
+        a.mfaChallenge.create({ data: {
+          userId: user.id, tokenHash: createHash("sha256").update(randomUUID()).digest("hex"), purpose: "STEP_UP",
+          operationPurpose: "MFA_DISABLE", authVersion: 0, expiresAt: new Date(recent.getTime() + 60_000),
+          consumedAt: recent, verifiedAt: recent, sessionId, resourceType: "USER", resourceId: user.id, mfaEnabledAt: user.enabledAt,
+        } }),
+        a.mfaChallenge.create({ data: {
+          userId: user.id, tokenHash: createHash("sha256").update(randomUUID()).digest("hex"), purpose: "STEP_UP",
+          operationPurpose: "MFA_RECOVERY_CODES_REGENERATE", authVersion: 0, expiresAt: new Date(recent.getTime() + 60_000),
+          consumedAt: recent, verifiedAt: recent, sessionId, resourceType: "USER", resourceId: randomUUID(), mfaEnabledAt: user.enabledAt,
+        } }),
+        a.mfaChallenge.create({ data: {
+          userId: user.id, tokenHash: createHash("sha256").update(randomUUID()).digest("hex"), purpose: "STEP_UP",
+          operationPurpose: "MFA_RECOVERY_CODES_REGENERATE", authVersion: 0, expiresAt: new Date(recent.getTime() + 60_000),
+          consumedAt: stale, verifiedAt: stale, sessionId, resourceType: "USER", resourceId: user.id, mfaEnabledAt: user.enabledAt,
+        } }),
+      ]);
+      const auth = { userId: user.id, role: "USER", authVersion: 0, sessionId, mfaEnabled: true, mfaVerifiedAt: issuedAt, assuranceLevel: "TOTP_VERIFIED" };
+      const middleware = createStepUpAuthorizationMiddleware({ purpose: "MFA_RECOVERY_CODES_REGENERATE", resourceId: user.id, getClient: async () => a, now });
+      const denied = await new Promise((resolve) => middleware({ auth, params: {} }, {}, (error) => resolve(error ?? null)));
+      assert.equal(denied.code, "MFA_ASSURANCE_REQUIRED");
+      for (const grant of grants) assert.equal((await a.mfaChallenge.findUnique({ where: { id: grant.id } })).grantConsumedAt, null);
     });
 
     await t.test("replaced MFA enrollment invalidates old grants and sessions", async () => {

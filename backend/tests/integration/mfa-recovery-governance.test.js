@@ -58,3 +58,86 @@ test("recovery-code regeneration is authenticated, uses the one-time self-resour
   });
 });
 
+test("legacy ADMIN onboarding inventory and request require fresh server-side TOTP assurance", async () => {
+  const calls = [];
+  const authenticationMiddleware = (request, _response, next) => {
+    const role = request.get("x-test-role");
+    if (!role) return next();
+    const assuranceLevel = request.get("x-test-assurance");
+    const mfaVerifiedAt = assuranceLevel === "TOTP_VERIFIED"
+      ? new Date(Date.now() - (request.get("x-test-expired") === "1" ? 301_000 : 60_000))
+      : assuranceLevel === "RECOVERY_CODE_VERIFIED" ? null : undefined;
+    request.auth = {
+      userId: "11111111-1111-4111-8111-111111111111",
+      role,
+      status: "ACTIVE",
+      authVersion: 3,
+      sessionId: "22222222-2222-4222-8222-222222222222",
+      assuranceLevel,
+      mfaEnabled: assuranceLevel === "TOTP_VERIFIED" || assuranceLevel === "RECOVERY_CODE_VERIFIED",
+      mfaVerifiedAt,
+    };
+    return next();
+  };
+  const app = createApp(environment, {
+    writeLog: () => {},
+    authenticationMiddleware,
+    mfaRecoveryMutationRateLimiter: (_request, _response, next) => next(),
+    mfaService: {
+      listLegacyAdminAccounts: async () => { calls.push("list"); return [{ id: "legacy-admin" }]; },
+      createLegacyAdminEnrollmentRequest: async () => { calls.push("create"); return { id: "request-id", expiresAt: new Date(Date.now() + 60_000) }; },
+    },
+  });
+
+  await withServer(app, async (base) => {
+    const listUrl = `${base}/api/v1/auth/mfa/admin-enrollment/legacy-admins`;
+    const createUrl = `${base}/api/v1/auth/mfa/admin-enrollment/requests`;
+    const headersFor = (role, assurance) => ({
+      ...(role ? { "x-test-role": role } : {}),
+      ...(assurance ? { "x-test-assurance": assurance } : {}),
+      "content-type": "application/json",
+    });
+    const createBody = JSON.stringify({ targetUserId: "33333333-3333-4333-8333-333333333333" });
+
+    for (const url of [listUrl, createUrl]) {
+      const forged = await fetch(`${url}?assuranceLevel=TOTP_VERIFIED`, {
+        method: url === listUrl ? "GET" : "POST",
+        headers: { "content-type": "application/json" },
+        ...(url === listUrl ? {} : { body: createBody }),
+      });
+      assert.equal(forged.status, 401);
+
+      for (const assurance of [undefined, "RECOVERY_CODE_VERIFIED"]) {
+        const response = await fetch(url, {
+          method: url === listUrl ? "GET" : "POST",
+          headers: headersFor("ADMIN", assurance),
+          ...(url === listUrl ? {} : { body: createBody }),
+        });
+        assert.equal(response.status, 403);
+      }
+
+      const expired = await fetch(url, {
+        method: url === listUrl ? "GET" : "POST",
+        headers: { ...headersFor("ADMIN", "TOTP_VERIFIED"), "x-test-expired": "1" },
+        ...(url === listUrl ? {} : { body: createBody }),
+      });
+      assert.equal(expired.status, 403);
+
+      const nonAdmin = await fetch(url, {
+        method: url === listUrl ? "GET" : "POST",
+        headers: headersFor("USER", "TOTP_VERIFIED"),
+        ...(url === listUrl ? {} : { body: createBody }),
+      });
+      assert.equal(nonAdmin.status, 403);
+    }
+
+    const before = calls.length;
+    const list = await fetch(listUrl, { headers: headersFor("ADMIN", "TOTP_VERIFIED") });
+    assert.equal(list.status, 200);
+    const create = await fetch(createUrl, { method: "POST", headers: headersFor("ADMIN", "TOTP_VERIFIED"), body: createBody });
+    assert.equal(create.status, 202);
+    assert.deepEqual(calls.slice(before), ["list", "create"]);
+    assert.equal(calls.length, 2, "denied and expired requests never invoke protected operations");
+  });
+});
+

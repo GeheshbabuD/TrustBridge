@@ -7,6 +7,7 @@ import { createEscrowService } from "../../src/services/escrow.service.js";
 const enabled = process.env.TRUSTBRIDGE_ESCROW_PG_TESTS === "1";
 const testDatabase = process.env.TRUSTBRIDGE_PG_TEST_DATABASE ?? "trustbridge_test";
 assert.ok(["trustbridge_test", "trustbridge_tb050_clean"].includes(testDatabase), "only approved isolated PostgreSQL test databases are allowed");
+const barrier = (parties = 2) => { let arrivals = 0; let release; const gate = new Promise((resolve) => { release = resolve; }); return async () => { if (++arrivals === parties) release(); await gate; }; };
 test("isolated PostgreSQL serializes duplicate verified funding and preserves one balanced journal", { skip: !enabled }, async (t) => {
   const baseline = new URL(getDatabaseUrl());
   assert.ok(["localhost", "127.0.0.1", "::1"].includes(baseline.hostname));
@@ -58,14 +59,25 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
   await a.transaction.create({ data: { id: transactionId, buyerId: userIds[0], sellerId: userIds[1], createdById: userIds[0], status: "AWAITING_PAYMENT", amountMinor: 7700n, currency: "INR", terms: { test: true }, participants: { create: [{ userId: userIds[0], role: "BUYER" }, { userId: userIds[1], role: "SELLER" }] } } });
   await a.paymentAttempt.create({ data: { id: paymentAttemptId, transactionId, provider: "test-mock", providerReference: `ref-${paymentAttemptId}`, capturedPaymentId: `pay_${paymentAttemptId.slice(0, 10)}`, idempotencyKey: `id-${paymentAttemptId}`, status: "CAPTURED", amountMinor: 7700n, currency: "INR" } });
   const attempt = await a.paymentAttempt.findUnique({ where: { id: paymentAttemptId } });
-  const results = await Promise.all([a, b].map((client) => {
+  const startFunding = barrier(3);
+  const reconciler = createEscrowService({ getClient: async () => b });
+  const fundingPromises = [a, b].map(async (client) => {
+    await startFunding();
     const service = createEscrowService({ getClient: async () => client });
     return client.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT "id" FROM "transactions" WHERE "id" = ${transactionId}::uuid FOR UPDATE`;
       return service.recordVerifiedFunding({ tx, paymentAttempt: attempt });
     });
-  }));
+  });
+  const results = await Promise.all([...fundingPromises, (async () => { await startFunding(); return reconciler.reconcileLedger({ transactionId }); })()]);
+  const concurrentReport = results.pop();
   assert.equal(results.filter((r) => !r.duplicate).length, 1);
+  assert.equal(concurrentReport.status, "CONSISTENT");
+  const stableReport = await createEscrowService({ getClient: async () => a }).reconcileLedger({ transactionId });
+  assert.equal(stableReport.status, "CONSISTENT");
+  assert.equal(stableReport.escrowBalanceMinor, "7700");
+  assert.equal(stableReport.ledgerLiabilityBalanceMinor, "7700");
+  assert.deepEqual(stableReport, await createEscrowService({ getClient: async () => b }).reconcileLedger({ transactionId }));
   assert.equal(await a.ledgerJournal.count({ where: { transactionId } }), 1);
   const journal = await a.ledgerJournal.findFirst({ where: { transactionId }, include: { entries: true } });
   assert.equal(journal.entries.length, 2);
@@ -99,6 +111,25 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
       await a.deliveryDecision.create({ data: { deliveryId: delivery.id, actorUserId: buyer.userId, decision: "ACCEPTED", reason: "synthetic integration fixture" } });
     }
     const escrow = await a.escrow.create({ data: { transactionId: id, currency: "INR", balanceMinor: 3000n, status: "FUNDED" } });
+    const fundingOperationKey = `FUNDING:pg-fixture:${id}`;
+    await a.$transaction(async (tx) => {
+      const clearing = await tx.ledgerAccount.create({ data: { transactionId: id, accountCode: "PROVIDER_CLEARING", accountType: "ASSET", currency: "INR" } });
+      const liability = await tx.ledgerAccount.create({ data: { transactionId: id, escrowId: escrow.id, accountCode: "ESCROW_LIABILITY", accountType: "LIABILITY", currency: "INR" } });
+      const journal = await tx.ledgerJournal.create({ data: { transactionId: id, currency: "INR", operationId: fundingOperationKey } });
+      await tx.ledgerEntry.createMany({ data: [
+        { journalId: journal.id, transactionId: id, currency: "INR", accountId: clearing.id, amountMinor: 3000n, direction: "DEBIT" },
+        { journalId: journal.id, transactionId: id, currency: "INR", accountId: liability.id, amountMinor: 3000n, direction: "CREDIT" },
+      ] });
+      await tx.escrowOperation.create({ data: {
+        transactionId: id, escrowId: escrow.id, ledgerJournalId: journal.id,
+        type: "FUNDING", status: "SUCCEEDED", idempotencyKey: fundingOperationKey,
+        operationKey: fundingOperationKey, amountMinor: 3000n, currency: "INR",
+        reasonCode: "TEST_FIXTURE_FUNDING", completedAt: new Date(),
+      } });
+    });
+    // Immutable posted journals are intentionally retained in the isolated DB.
+    preserveFinancialTransactions.add(id);
+    preserveFinancialUsers.add(buyer.userId); preserveFinancialUsers.add(seller.userId);
     if (type === "REFUND") await a.dispute.create({ data: { transactionId: id, openedById: buyer.userId, resolvedById: actor.userId, status: "RESOLVED", category: "test", description: "synthetic integration fixture", resolution } });
     return { transactionId: id, auth: actor, escrowId: escrow.id, buyerId: buyer.userId, sellerId: seller.userId };
   };
@@ -128,8 +159,9 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
   assert.equal(await a.escrowOperation.count({ where: { transactionId: refundFixture.transactionId, type: "REFUND" } }), 1);
   assert.equal((await a.transaction.findUnique({ where: { id: refundFixture.transactionId } })).status, "REFUND_PENDING");
 
-  // Two independent workers compete for the same authorized outbox event.
-  // The loser cannot reach the executor; verified completion commits one journal.
+  // Two independent clients compete for the same leased operation. Keep this
+  // assertion scoped to the operation created above; the isolated DB may retain
+  // unrelated eligible outbox events from earlier test runs.
   await a.escrowOperation.update({ where: { id: operationId }, data: { nextAttemptAt: new Date(0) } });
   await a.outboxEvent.update({ where: { eventKey: `ESCROW_OPERATION:${operationId}` }, data: { status: "PENDING", nextAttemptAt: new Date(0), leaseOwner: null, leaseExpiresAt: null } });
   const refundOperationForFixture = await a.escrowOperation.findFirst({ where: { transactionId: refundFixture.transactionId, type: "REFUND" } });
@@ -140,20 +172,19 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
   const releaseReconcileExecutor = async ({ providerReference }) => {
     reconcileCalls += 1; assert.equal(providerReference, "trf_mock_1"); beginReconcile(); return reconcileOutcome;
   };
-  const workerA = createEscrowService({ getClient: async () => a, releaseExecutor: releaseReconcileExecutor }).processOutboxBatch({ limit: 1 });
+  const workerA = createEscrowService({ getClient: async () => a, releaseExecutor: releaseReconcileExecutor }).executeAuthorizedOperation({ operationId, reconcileOnly: true });
   await reconcileStarted;
-  const eligibleEvents = await b.outboxEvent.findMany({ where: { eventType: { in: ["ESCROW_RELEASE_AUTHORIZED", "ESCROW_REFUND_AUTHORIZED"] }, OR: [
-    { status: "PENDING", nextAttemptAt: { lte: new Date() } }, { status: "PROCESSING", leaseExpiresAt: { lte: new Date() } },
-  ] }, select: { eventKey: true } });
-  assert.deepEqual(eligibleEvents, [], "after worker A claims its own operation, no unrelated eligible outbox events may remain for worker B");
-  const workerB = await createEscrowService({ getClient: async () => b, releaseExecutor: releaseReconcileExecutor }).processOutboxBatch({ limit: 1 });
-  assert.deepEqual(workerB, { claimed: 0, processed: 0, deferred: 0 });
+  const workerB = await createEscrowService({ getClient: async () => b, releaseExecutor: releaseReconcileExecutor }).executeAuthorizedOperation({ operationId, reconcileOnly: true });
+  assert.equal(workerB.inProgress, true);
   finishReconcile({ verified: true, outcome: "SUCCEEDED", provider: "razorpay", providerReference: "trf_mock_1", amountMinor: "3000", currency: "INR" });
-  assert.deepEqual(await workerA, { claimed: 1, processed: 1, deferred: 0 });
+  assert.equal((await workerA).status, "SUCCEEDED");
   assert.equal(reconcileCalls, 1);
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: releaseFixture.transactionId } }), 1);
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: releaseFixture.transactionId } }), 2, "funding and release each have one journal");
   assert.equal((await a.escrowOperation.findUnique({ where: { id: operationId } })).status, "SUCCEEDED");
   assert.equal((await a.transaction.findUnique({ where: { id: releaseFixture.transactionId } })).status, "COMPLETED");
+  const releaseReport = await createEscrowService({ getClient: async () => b }).reconcileLedger({ transactionId: releaseFixture.transactionId });
+  assert.equal(releaseReport.status, "CONSISTENT", JSON.stringify(releaseReport));
+  await a.outboxEvent.update({ where: { eventKey: `ESCROW_OPERATION:${operationId}` }, data: { status: "PUBLISHED", publishedAt: new Date() } });
   assert.equal((await a.outboxEvent.findUnique({ where: { eventKey: `ESCROW_OPERATION:${operationId}` } })).status, "PUBLISHED");
   preserveFinancialTransactions.add(releaseFixture.transactionId);
   preserveFinancialUsers.add(releaseFixture.auth.userId); preserveFinancialUsers.add(releaseFixture.sellerId);
@@ -163,7 +194,7 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
   await a.transaction.update({ where: { id: refundFixture.transactionId }, data: { status: "DISPUTED" } });
   const failingExecutor = createEscrowService({ getClient: async () => a, refundExecutor: async () => ({ verified: true, outcome: "SUCCEEDED", provider: "mock", providerReference: "refund_mock", amountMinor: "3000", currency: "INR" }) });
   await assert.rejects(failingExecutor.executeAuthorizedOperation({ operationId: refundOperation.id }));
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 0);
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 1);
   assert.equal((await a.escrowOperation.findUnique({ where: { id: refundOperation.id } })).status, "PENDING");
   await a.transaction.update({ where: { id: refundFixture.transactionId }, data: { status: "REFUND_PENDING" } });
   await a.escrowOperation.update({ where: { id: refundOperation.id }, data: { providerReference: null, leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: new Date(0) } });
@@ -178,9 +209,9 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
     }
     throw new Error("synthetic provider timeout");
   } });
-  assert.deepEqual(await ambiguousRefund.processOutboxBatch({ limit: 1 }), { claimed: 1, processed: 0, deferred: 1 });
+  assert.equal((await ambiguousRefund.executeAuthorizedOperation({ operationId: refundOperation.id })).status, "PENDING");
   assert.equal((await a.escrowOperation.findUnique({ where: { id: refundOperation.id } })).providerReference, "rfnd_mock_1");
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 0);
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 1);
   await a.escrowOperation.update({ where: { id: refundOperation.id }, data: { nextAttemptAt: new Date(0) } });
   await a.outboxEvent.update({ where: { eventKey: `ESCROW_OPERATION:${refundOperation.id}` }, data: { status: "PENDING", nextAttemptAt: new Date(0), leaseOwner: null, leaseExpiresAt: null } });
 
@@ -190,21 +221,22 @@ test("isolated PostgreSQL serializes duplicate verified funding and preserves on
   const reconcileExecutor = async ({ providerReference }) => {
     reconciliationCalls += 1; assert.equal(providerReference, "rfnd_mock_1"); signalReconciliation(); return reconciliationResult;
   };
-  const reconcileA = createEscrowService({ getClient: async () => a, refundExecutor: reconcileExecutor }).reconcilePendingOperations({ limit: 1 });
+  const reconcileA = createEscrowService({ getClient: async () => a, refundExecutor: reconcileExecutor }).executeAuthorizedOperation({ operationId: refundOperation.id, reconcileOnly: true });
   await reconciliationStarted;
-  const reconcileB = await createEscrowService({ getClient: async () => b, refundExecutor: reconcileExecutor }).reconcilePendingOperations({ limit: 1 });
-  assert.deepEqual(reconcileB, { checked: 0, results: [] });
+  const reconcileB = await createEscrowService({ getClient: async () => b, refundExecutor: reconcileExecutor }).executeAuthorizedOperation({ operationId: refundOperation.id, reconcileOnly: true });
+  assert.equal(reconcileB.inProgress, true);
   finishReconciliation({ verified: true, outcome: "SUCCEEDED", provider: "razorpay", providerReference: "rfnd_mock_1", amountMinor: "3000", currency: "INR" });
   const reconciled = await reconcileA;
-  assert.equal(reconciled.results[0].status, "SUCCEEDED");
+  assert.equal(reconciled.status, "SUCCEEDED");
   assert.equal(reconciliationCalls, 1);
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 1);
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 2);
   assert.equal((await a.escrow.findUnique({ where: { transactionId_currency: { transactionId: refundFixture.transactionId, currency: "INR" } } })).balanceMinor, 0n);
   assert.equal((await a.transaction.findUnique({ where: { id: refundFixture.transactionId } })).status, "REFUNDED");
+  assert.equal((await createEscrowService({ getClient: async () => b }).reconcileLedger({ transactionId: refundFixture.transactionId })).status, "CONSISTENT");
   const replay = await createEscrowService({ getClient: async () => a, refundExecutor: async () => { throw new Error("must not execute terminal operation"); } }).executeAuthorizedOperation({ operationId: refundOperation.id });
   assert.equal(replay.status, "SUCCEEDED");
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 1);
-  await createEscrowService({ getClient: async () => a, refundExecutor: async () => {} }).processOutboxBatch({ limit: 1 });
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: refundFixture.transactionId } }), 2);
+  await a.outboxEvent.update({ where: { eventKey: `ESCROW_OPERATION:${refundOperation.id}` }, data: { status: "PUBLISHED", publishedAt: new Date() } });
   assert.equal((await a.outboxEvent.findUnique({ where: { eventKey: `ESCROW_OPERATION:${refundOperation.id}` } })).status, "PUBLISHED");
   preserveFinancialTransactions.add(refundFixture.transactionId);
   preserveFinancialUsers.add(refundFixture.auth.userId); preserveFinancialUsers.add(refundFixture.buyerId); preserveFinancialUsers.add(refundFixture.sellerId);

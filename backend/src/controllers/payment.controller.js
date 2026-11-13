@@ -31,6 +31,7 @@ export const createPaymentController = ({ paymentService }) => ({
     if (!provider.success || !Buffer.isBuffer(request.rawBody)) return next(invalid());
     try {
       const result = await paymentService.receiveWebhook({ provider: provider.data, rawBody: request.rawBody, signature: request.get("x-razorpay-signature") ?? request.get("x-payment-signature"), eventId: request.get("x-razorpay-event-id"), requestId: request.requestId });
+      if (result.integrityConflict === true) return response.status(202).json({ success: true, message: "Webhook received for review", data: { accepted: true, reconciliationRequired: true } });
       return response.status(200).json({ success: true, message: "Webhook accepted", data: result });
     } catch (error) { return next(error); }
   },

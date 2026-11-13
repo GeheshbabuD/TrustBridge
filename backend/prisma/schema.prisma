@@ -203,6 +203,32 @@ enum LedgerDirection {
   CREDIT
 }
 
+enum LedgerReconciliationRunStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  PARTIAL
+  FAILED
+}
+
+enum LedgerReconciliationTriggerType {
+  MANUAL
+  SCHEDULED
+}
+
+enum LedgerReconciliationItemStatus {
+  PENDING
+  PROCESSING
+  CONSISTENT
+  DISCREPANCY
+  FAILED
+}
+
+enum LedgerReconciliationFindingStatus {
+  OPEN
+  RESOLVED
+}
+
 model User {
   id           String     @id @default(uuid()) @db.Uuid
   // Persist a canonical lowercase/trimmed email; ingress normalization belongs
@@ -241,8 +267,9 @@ model User {
   sentTransactionInvitations     TransactionInvitation[]    @relation("TransactionInvitationInviter")
   receivedTransactionInvitations TransactionInvitation[]    @relation("TransactionInvitationInvitee")
   escrowOperations               EscrowOperation[]          @relation("EscrowOperationActor")
-  submittedDeliveries            TransactionDelivery[]       @relation("DeliverySubmitter")
-  deliveryDecisions              DeliveryDecision[]          @relation("DeliveryDecisionActor")
+  submittedDeliveries            TransactionDelivery[]      @relation("DeliverySubmitter")
+  deliveryDecisions              DeliveryDecision[]         @relation("DeliveryDecisionActor")
+  reconciliationRuns             LedgerReconciliationRun[]  @relation("ReconciliationRunRequester")
 
   @@index([status, createdAt], map: "users_status_created_at_idx")
   @@index([role, status], map: "users_role_status_idx")
@@ -276,24 +303,26 @@ model Transaction {
   createdAt   DateTime          @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt   DateTime          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
 
-  buyer             User                       @relation("TransactionBuyer", fields: [buyerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  seller            User                       @relation("TransactionSeller", fields: [sellerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  createdBy         User                       @relation("TransactionCreator", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Cascade)
-  participants      TransactionParticipant[]
-  paymentAttempts   PaymentAttempt[]
-  escrow            Escrow?
-  ledgerAccounts    LedgerAccount[]
-  ledgerJournals    LedgerJournal[]
-  disputes          Dispute[]
-  riskAssessments   RiskAssessment[]
-  aiAnalyses        AIAnalysis[]
-  blockchainRecords BlockchainRecord[]
-  statusHistory     TransactionStatusHistory[]
-  outboxEvents      OutboxEvent[]
-  termsVersions     TransactionTermsVersion[]
-  invitations       TransactionInvitation[]
-  escrowOperations  EscrowOperation[]
-  deliveries        TransactionDelivery[]
+  buyer                  User                          @relation("TransactionBuyer", fields: [buyerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  seller                 User                          @relation("TransactionSeller", fields: [sellerId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  createdBy              User                          @relation("TransactionCreator", fields: [createdById], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  participants           TransactionParticipant[]
+  paymentAttempts        PaymentAttempt[]
+  escrow                 Escrow?
+  ledgerAccounts         LedgerAccount[]
+  ledgerJournals         LedgerJournal[]
+  disputes               Dispute[]
+  riskAssessments        RiskAssessment[]
+  aiAnalyses             AIAnalysis[]
+  blockchainRecords      BlockchainRecord[]
+  statusHistory          TransactionStatusHistory[]
+  outboxEvents           OutboxEvent[]
+  termsVersions          TransactionTermsVersion[]
+  invitations            TransactionInvitation[]
+  escrowOperations       EscrowOperation[]
+  deliveries             TransactionDelivery[]
+  reconciliationItems    LedgerReconciliationRunItem[]
+  reconciliationFindings LedgerReconciliationFinding[]
 
   // Composite references below keep all transaction-bound financial rows in
   // this transaction's currency. id is already primary; this key supports FKs.
@@ -488,6 +517,100 @@ model LedgerEntry {
   @@map("ledger_entries")
 }
 
+// Operational reconciliation metadata only. These records have no financial
+// posting relations and must never be used to mutate payment, escrow or ledger state.
+model LedgerReconciliationRun {
+  id                 String                          @id @default(uuid()) @db.Uuid
+  idempotencyKey     String                          @unique(map: "ledger_reconciliation_runs_idempotency_key") @map("idempotency_key") @db.VarChar(128)
+  triggerType        LedgerReconciliationTriggerType @map("trigger_type")
+  status             LedgerReconciliationRunStatus   @default(QUEUED)
+  requestedById      String?                         @map("requested_by_id") @db.Uuid
+  cutoffAt           DateTime                        @default(now()) @map("cutoff_at") @db.Timestamptz(6)
+  itemLimit          Int                             @map("item_limit")
+  pageSize           Int                             @map("page_size")
+  candidateCount     Int                             @default(0) @map("candidate_count")
+  scannedCount       Int                             @default(0) @map("scanned_count")
+  consistentCount    Int                             @default(0) @map("consistent_count")
+  discrepancyCount   Int                             @default(0) @map("discrepancy_count")
+  failedCount        Int                             @default(0) @map("failed_count")
+  continuationCursor String?                         @map("continuation_cursor") @db.VarChar(128)
+  hasMore            Boolean                         @default(false) @map("has_more")
+  attemptCount       Int                             @default(0) @map("attempt_count")
+  leaseOwner         String?                         @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt     DateTime?                       @map("lease_expires_at") @db.Timestamptz(6)
+  lastErrorCode      String?                         @map("last_error_code") @db.VarChar(100)
+  startedAt          DateTime?                       @map("started_at") @db.Timestamptz(6)
+  completedAt        DateTime?                       @map("completed_at") @db.Timestamptz(6)
+  createdAt          DateTime                        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime                        @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  requestedBy      User?                         @relation("ReconciliationRunRequester", fields: [requestedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  items            LedgerReconciliationRunItem[]
+  firstFindings    LedgerReconciliationFinding[] @relation("ReconciliationFindingFirstRun")
+  lastFindings     LedgerReconciliationFinding[] @relation("ReconciliationFindingLastRun")
+  resolvedFindings LedgerReconciliationFinding[] @relation("ReconciliationFindingResolvedRun")
+
+  @@index([status, leaseExpiresAt, createdAt], map: "ledger_reconciliation_runs_claim_idx")
+  @@index([requestedById, createdAt], map: "ledger_reconciliation_runs_requester_idx")
+  @@map("ledger_reconciliation_runs")
+}
+
+model LedgerReconciliationRunItem {
+  id             String                         @id @default(uuid()) @db.Uuid
+  runId          String                         @map("run_id") @db.Uuid
+  transactionId  String                         @map("transaction_id") @db.Uuid
+  ordinal        Int
+  status         LedgerReconciliationItemStatus @default(PENDING)
+  attemptCount   Int                            @default(0) @map("attempt_count")
+  snapshotAt     DateTime                       @default(now()) @map("snapshot_at") @db.Timestamptz(6)
+  claimedAt      DateTime?                      @map("claimed_at") @db.Timestamptz(6)
+  leaseOwner     String?                        @map("lease_owner") @db.VarChar(128)
+  leaseExpiresAt DateTime?                      @map("lease_expires_at") @db.Timestamptz(6)
+  retryAt        DateTime?                      @map("retry_at") @db.Timestamptz(6)
+  lastErrorCode  String?                        @map("last_error_code") @db.VarChar(100)
+  completedAt    DateTime?                      @map("completed_at") @db.Timestamptz(6)
+  createdAt      DateTime                       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime                       @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  run         LedgerReconciliationRun @relation(fields: [runId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  transaction Transaction             @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([runId, transactionId], map: "ledger_reconciliation_run_items_run_transaction_key")
+  @@unique([runId, ordinal], map: "ledger_reconciliation_run_items_run_ordinal_key")
+  @@index([runId, status, retryAt, ordinal], map: "ledger_reconciliation_run_items_claim_idx")
+  @@index([transactionId, snapshotAt], map: "ledger_reconciliation_run_items_transaction_snapshot_idx")
+  @@map("ledger_reconciliation_run_items")
+}
+
+model LedgerReconciliationFinding {
+  id              String                            @id @default(uuid()) @db.Uuid
+  transactionId   String                            @map("transaction_id") @db.Uuid
+  discrepancyCode String                            @map("discrepancy_code") @db.VarChar(100)
+  status          LedgerReconciliationFindingStatus @default(OPEN)
+  occurrenceCount Int                               @default(1) @map("occurrence_count")
+  expectedCount   Int?                              @map("expected_count")
+  observedCount   Int?                              @map("observed_count")
+  firstSeenAt     DateTime                          @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt      DateTime                          @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  resolvedAt      DateTime?                         @map("resolved_at") @db.Timestamptz(6)
+  firstRunId      String?                           @map("first_run_id") @db.Uuid
+  lastRunId       String?                           @map("last_run_id") @db.Uuid
+  resolvedByRunId String?                           @map("resolved_by_run_id") @db.Uuid
+  createdAt       DateTime                          @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime                          @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  transaction   Transaction              @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  firstRun      LedgerReconciliationRun? @relation("ReconciliationFindingFirstRun", fields: [firstRunId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  lastRun       LedgerReconciliationRun? @relation("ReconciliationFindingLastRun", fields: [lastRunId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  resolvedByRun LedgerReconciliationRun? @relation("ReconciliationFindingResolvedRun", fields: [resolvedByRunId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([transactionId, discrepancyCode], map: "ledger_reconciliation_findings_transaction_code_key")
+  @@index([status, lastSeenAt], map: "ledger_reconciliation_findings_status_seen_idx")
+  @@index([firstRunId], map: "ledger_reconciliation_findings_first_run_idx")
+  @@index([lastRunId], map: "ledger_reconciliation_findings_last_run_idx")
+  @@map("ledger_reconciliation_findings")
+}
+
 // Durable authorization/execution envelope. Provider execution is separate;
 // internal escrow remains an accounting record, not legal custody.
 model EscrowOperation {
@@ -572,8 +695,8 @@ model TransactionDelivery {
   description   String   @db.VarChar(4000)
   createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  transaction Transaction         @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-  submittedBy User                @relation("DeliverySubmitter", fields: [submittedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  transaction Transaction       @relation(fields: [transactionId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  submittedBy User              @relation("DeliverySubmitter", fields: [submittedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
   decision    DeliveryDecision?
   evidence    Evidence[]
 
@@ -617,22 +740,22 @@ model DisputeActivity {
 }
 
 model Evidence {
-  id               String   @id @default(uuid()) @db.Uuid
-  disputeId        String?  @map("dispute_id") @db.Uuid
-  transactionDeliveryId String? @map("transaction_delivery_id") @db.Uuid
-  uploadedById     String   @map("uploaded_by_id") @db.Uuid
-  category         String   @db.VarChar(80)
+  id                    String   @id @default(uuid()) @db.Uuid
+  disputeId             String?  @map("dispute_id") @db.Uuid
+  transactionDeliveryId String?  @map("transaction_delivery_id") @db.Uuid
+  uploadedById          String   @map("uploaded_by_id") @db.Uuid
+  category              String   @db.VarChar(80)
   // Opaque private-storage key only; this is not a URL or an access capability.
-  storageObjectKey String   @unique(map: "evidence_storage_object_key_key") @map("storage_object_key") @db.VarChar(512)
-  originalFilename String?  @map("original_filename") @db.VarChar(255)
-  contentType      String   @map("content_type") @db.VarChar(127)
-  sizeBytes        BigInt   @map("size_bytes")
-  sha256Hash       String   @map("sha256_hash") @db.Char(64)
-  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  storageObjectKey      String   @unique(map: "evidence_storage_object_key_key") @map("storage_object_key") @db.VarChar(512)
+  originalFilename      String?  @map("original_filename") @db.VarChar(255)
+  contentType           String   @map("content_type") @db.VarChar(127)
+  sizeBytes             BigInt   @map("size_bytes")
+  sha256Hash            String   @map("sha256_hash") @db.Char(64)
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
 
-  dispute    Dispute? @relation(fields: [disputeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  dispute    Dispute?             @relation(fields: [disputeId], references: [id], onDelete: Restrict, onUpdate: Restrict)
   delivery   TransactionDelivery? @relation(fields: [transactionDeliveryId], references: [id], onDelete: Restrict, onUpdate: Restrict)
-  uploadedBy User     @relation("EvidenceUploader", fields: [uploadedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  uploadedBy User                 @relation("EvidenceUploader", fields: [uploadedById], references: [id], onDelete: Restrict, onUpdate: Restrict)
 
   @@index([disputeId, createdAt], map: "evidence_dispute_created_idx")
   @@index([transactionDeliveryId, createdAt], map: "evidence_delivery_created_idx")

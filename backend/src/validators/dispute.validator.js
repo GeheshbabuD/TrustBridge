@@ -14,5 +14,6 @@ export const disputeResolutionSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("SELLER_RELEASE"), reason: z.string().trim().min(10).max(2000) }).strict(),
 ]);
 export const disputeIdSchema = uuid;
+export const disputeParamsSchema = z.object({ disputeId: disputeIdSchema }).strict();
 export const transactionIdSchema = uuid;
 export const disputeIdempotencyKeySchema = idempotencyKey;

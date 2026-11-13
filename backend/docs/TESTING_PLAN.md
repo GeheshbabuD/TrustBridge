@@ -234,6 +234,14 @@ Executed using Node v24.22.1 (within package ^24.0.0 || ^26.0.0) and npm 11.6.2.
 
 The package scripts were compared with package.json: start/dev/test/test:watch/prisma:generate exist; no migrate or standalone worker script exists. Prisma CLI is a development dependency. Run migrations in a separate serialized job/tool artifact from the same commit and lockfile with Prisma CLI available; do not assume the production-only web runtime has it. The deployment guide's stale database: not_checked wording was corrected. Provider/platform and deployed-artifact validation remain outstanding.
 
+## TB-BE-065 — Worker readiness and alerting (2026-11-13)
+
+`node --test tests/unit/server-lifecycle.test.js tests/integration/app.test.js` passed **33/33** with loopback permission. Tests cover required escrow startup failure, runtime degradation and recovery, optional worker non-gating behavior, unmanaged escrow readiness, liveness separation, sanitized alert payloads, alert-delivery failure isolation, and disabled worker serialization. Full `npm.cmd test` passed **422**, failed **0**, skipped **11** (433 total including nested tests). These checks use injected workers and alert fakes; no external alert delivery was verified. The default structured-log sink is not proof of on-call notification delivery.
+
+## TB-BE-066 — Escrow outbox poison-event handling (2026-11-13)
+
+`node --test tests/unit/escrow-ledger.test.js tests/unit/escrow-outbox.worker.test.js` passed **15/15**. Coverage includes structurally invalid event terminalization and no replay/executor call, transient lookup failure with unchanged 60-second retry, expired lease reclaim, competing service claims, and ambiguous provider outcome behavior. Full `npm.cmd test` passed **425**, failed **0**, skipped **11** (436 total including nested tests). Concurrency cases here use deterministic mocks; this task did not run PostgreSQL integration tests or claim database-level concurrency proof.
+
 ## 2026-11-06 MFA/recovery audit verification
 
 - `node --test tests/unit/mfa-service.test.js tests/unit/mfa-persistence.test.js tests/unit/mfa-crypto.test.js tests/unit/totp.service.test.js tests/unit/recent-mfa.middleware.test.js` — **46 passed, 0 failed, 0 skipped**.
@@ -253,3 +261,44 @@ Commands/results:
 - `npm.cmd test` with loopback permission — **379 passed, 0 failed, 9 skipped** (388 total).
 
 No application/test code, database, migration, Redis or provider was changed/accessed. To reproduce from a permitted PowerShell environment, run the three commands above from the backend directory; the HTTP and full commands require permission for local loopback connections.
+
+### Wallet balance/history API (pending accounting design)
+
+No wallet API tests are currently applicable: the schema has no user-owned wallet accounts, and existing postings cover transaction-scoped provider clearing and escrow liability only. After accounting semantics and a wallet ledger source are approved, test empty/multi-currency balances, posted/reversed entries, ownership, deterministic pagination, BigInt boundaries, escrow exclusion and reconciliation against that ledger. Do not treat mocked or derived transaction rows as wallet funds.
+
+### WB-02 wallet verification gate
+
+Wallet service and PostgreSQL tests are not yet applicable because no safe wallet funding source has been selected. Before adding tests, implement and verify the approved proceeds path, wallet ownership/bucket constraints, verified settlement evidence and withdrawal provider fail-closed boundary. Required tests include the WB-02 cases plus explicit proof that a transaction's escrow posting cannot also create wallet credit, concurrent reservation/overspend, idempotent settlement/reversal, rollback, and per-user/transaction/currency reconciliation. No DB identity checks or operations were performed in this design reconciliation.
+
+### WB-02A verification gates
+
+Wallet tests remain unrun because implementation and schema do not exist. The design now requires explicit tests for separate wallet funding versus escrow, capture-versus-settlement evidence, source/event deduplication, immutable balanced reversals, atomic reservations and verified payout finality. WB-02 must not be marked complete until isolated PostgreSQL concurrency tests and provider-mocked workflow tests pass; external provider staging is separately required before production execution.
+
+### WB-02A wallet test requirements
+
+No wallet implementation or tests exist. Before WB-02 completion, verify distinct independent funding references, capture-versus-settlement, no escrow/Route wallet credit, wallet-to-escrow exactly once, pending/available/reserved accounting, concurrent withdrawal reservation, ambiguous payout retention, duplicate/reversal handling, balanced immutable journals, ownership and rollback on isolated PostgreSQL. Providers must be mocked; no real financial calls.
+
+## Phase 3 — seller lookup and administrator listings
+
+Added HTTP/unit coverage for authenticated seller display-name search, active USER filtering, safe projection, validation and cursor pagination; ADMIN transaction/dispute listing filters, deterministic ordering, BigInt serialization, safe-field exclusion, recent-MFA/RBAC denial and rate-limit invocation. Focused command `node --test tests/unit/marketplace-query.service.test.js tests/integration/marketplace-admin-listing.test.js` passed **5/5**. Related regression command `node --test tests/integration/transaction.test.js tests/integration/dispute.test.js tests/integration/user.test.js` passed **6/6**. HTTP runs required local ephemeral-loopback permission and used mocked Prisma only. No PostgreSQL, provider, migration or database operations occurred. Full suite not run.
+
+## TB-BE-046 — focused authentication/session regression coverage
+
+`tests/unit/session-service.test.js` covers refresh lineage, replay-family revocation, expiry, logout idempotency, concurrent refresh, assurance preservation and account-wide logout isolation. `tests/integration/auth.test.js` covers the protected logout-all route, caller-derived identity, refresh/logout contracts and login/MFA rate limits. `tests/unit/step-up.middleware.test.js` and `tests/unit/recent-mfa.middleware.test.js` cover expired/stale/forged, replayed, mismatched and recovery-assurance step-up rejection. Real PostgreSQL refresh concurrency coverage exists at `tests/postgres/assurance-concurrency.integration.test.js`; it must be enabled only with verified isolated `trustbridge_test` and was not executed in this task.
+
+## TB-BE-047 — PostgreSQL refresh/session concurrency verification (2026-11-12)
+
+The isolated opt-in integration command `TRUSTBRIDGE_PG_TESTS=1 node --experimental-strip-types --test tests/postgres/assurance-concurrency.integration.test.js` passed **13/13 TAP tests** (one parent plus 12 nested scenarios). The harness forces `trustbridge_test`, verifies local PostgreSQL 17.10 on port 5432 and loopback before fixture writes, and asserts two Prisma clients have distinct PostgreSQL backend PIDs. Concurrent refresh produced one rotation winner and one rejected reuse; replay revoked both family rows, leaving zero active family sessions. No migration was run. No development or production database was targeted.
+
+## TB-BE-048 — Razorpay lifecycle tests (2026-11-12)
+
+Focused unit: `node --test tests/unit/razorpay-payment.adapter.test.js tests/unit/payment-service.test.js` — **27 passed, 0 failed**. Payment HTTP: `node --test tests/integration/payment.test.js` — **4 passed, 0 failed** with loopback permission; sandbox-only fetch failed before assertions. Full `npm.cmd test` with loopback permission — **389 passed, 0 failed, 9 skipped (398 total including nested tests)**. Isolated PostgreSQL: `TRUSTBRIDGE_PAYMENT_PG_TESTS=1`, `TRUSTBRIDGE_PG_TEST_DATABASE=trustbridge_test`, `node --experimental-strip-types --test tests/postgres/payment-concurrency.integration.test.js` — **6 passed, 0 failed**, including two-client duplicate capture delivery racing cancellation. Harness verified test DB identity, PostgreSQL 17, loopback and migration parity before scoped fixtures. No migration, provider call or development/production DB operation occurred.
+### TB-BE-049 financial lifecycle audit evidence (2026-11-12)
+
+Existing coverage is located in the payment, escrow-ledger, Razorpay executor, dispute HTTP and PostgreSQL concurrency suites listed in `FINANCIAL_LIFECYCLE_AUDIT.md`. The development log records prior TB-BE-048 PostgreSQL concurrency at 6/6 and full suite at 389 passed / 0 failed / 9 skipped; neither was rerun for this read-only audit. Add isolated PostgreSQL cases for dispute-versus-release/refund races, conflicting duplicate webhook IDs, reversal reconciliation, escrow projection drift and partial-refund/dispute lifecycle before claiming those cases verified. No tests or database operations were run for TB-BE-049.
+### TB-BE-050 webhook integrity verification (2026-11-12)
+
+Focused service tests cover bad-signature non-persistence, identical duplicates, conflicting event-ID payload quarantine, preserving accepted event data, and no payment-state change on conflict. HTTP tests verify exact raw-body forwarding and sanitized 202 integrity-review response. The isolated PostgreSQL two-client payment suite races identical signed capture delivery and verifies one inbox event, escrow funding operation and balanced journal, then reuses that event ID with a conflicting signed amount and verifies the accepted envelope remains unchanged and no second journal appears. Commands/results: payment unit **16/16**; payment HTTP **5/5** (loopback permission); `TRUSTBRIDGE_PAYMENT_PG_TESTS=1 node --experimental-strip-types --test tests/postgres/payment-concurrency.integration.test.js` **6/6** on the harness-verified local isolated `trustbridge_test`; full `npm.cmd test` **391 passed, 0 failed, 9 skipped** (400 total including nested tests). No migration or real provider calls.
+### TB-BE-051 ledger reconciliation
+
+`tests/unit/ledger-reconciliation.test.js` covers stable balanced snapshots; missing/duplicate/unbalanced journals; incorrect escrow balance; missing/duplicate operation links; partial/full refunds and release; reversal arithmetic/unsupported `REVERSED`; repeatability; and read-only transaction setup. TB-BE-051A scoped the escrow PostgreSQL suite to test-owned operation IDs instead of processing/asserting over global outbox events. Release/refund fixtures now have balanced funding journals. On identity/migration-checked isolated PostgreSQL 17.10 `trustbridge_tb050_clean`, final runs passed: escrow funding/release/full-refund suite **1/1**; dispute partial-refund/release suite **1/1**; read-only reconciliation snapshot and anomaly suite **1/1**. The database suite verifies persisted escrow/liability mismatch, duplicate journal-line, successful operations with missing journals, and unchanged balance/record counts during reads, and a concurrent uncommitted funding transaction/rollback across two Prisma clients. Unit focused tests: **16/16**. Final `npm.cmd test` on Node 24.22.1: **397 passed, 0 failed, 10 skipped (407 total)**. The ten skips are opt-in PostgreSQL/Redis tests not enabled by the general suite. No development/production DB, migration, provider or existing-record cleanup was performed.

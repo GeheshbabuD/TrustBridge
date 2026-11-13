@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { getPrismaClient } from "../config/db.js";
 import { getEnv } from "../config/env.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -9,6 +9,18 @@ const unavailable = () => new ApiError(503, "PAYMENT_UNAVAILABLE", "Payment serv
 const denied = () => new ApiError(404, "RESOURCE_NOT_FOUND", "Resource not found");
 const conflict = (code = "PAYMENT_CONFLICT") => new ApiError(409, code, "Payment operation conflicts with current state");
 const safeOutcome = (row) => ({ id: row.id, status: row.status, amountMinor: row.amountMinor.toString(), currency: row.currency.trim(), createdAt: row.createdAt, updatedAt: row.updatedAt });
+const checkoutConfiguration = (attempt, providerAdapter) => {
+  if (!attempt || attempt.provider !== "razorpay" || attempt.status !== "PENDING"
+    || typeof attempt.providerReference !== "string" || !attempt.providerReference
+    || typeof providerAdapter?.getCheckoutConfiguration !== "function"
+    || attempt.currency.trim() !== "INR") return null;
+  let configuration;
+  try { configuration = providerAdapter.getCheckoutConfiguration(); } catch { return null; }
+  const amount = Number(attempt.amountMinor);
+  if (!configuration || typeof configuration.key !== "string" || !/^[A-Za-z0-9_-]{1,80}$/.test(configuration.key)
+    || !Number.isSafeInteger(amount) || amount < 1) return null;
+  return { key: configuration.key, order_id: attempt.providerReference, amount, currency: attempt.currency.trim() };
+};
 const stableFingerprint = (secret, values) => createHmac("sha256", secret ?? getEnv().rateLimit.keySecret).update(JSON.stringify(values)).digest("hex");
 const validNormalizedEvent = (event) => Boolean(event
   && typeof event.eventId === "string" && /^[A-Za-z0-9._:-]{1,255}$/.test(event.eventId)
@@ -23,6 +35,43 @@ const validNormalizedEvent = (event) => Boolean(event
 export const createPaymentService = ({ getClient = getPrismaClient, adapter, enabled = false, provider, fundingService, fingerprintSecret = "payment-test-fingerprint", now = () => new Date() } = {}) => {
   const lockTransaction = (tx, id) => tx.$queryRaw`SELECT "id" FROM "transactions" WHERE "id" = ${id}::uuid FOR UPDATE`;
   const audit = (tx, actorUserId, action, transactionId, requestId, metadata) => tx.auditLog.create({ data: { actorUserId: actorUserId ?? null, action, entityType: "PaymentAttempt", entityId: transactionId, requestId: requestId ?? null, metadata } });
+  const quarantineWebhookConflict = async (tx, current, incomingProvider, event, payloadSha256, requestId) => {
+    if (current.eventData?.payloadSha256 === payloadSha256) {
+      return current.lastErrorCode === "EVENT_ID_PAYLOAD_CONFLICT"
+        ? { accepted: true, duplicate: true, integrityConflict: true, reconciliationRequired: true }
+        : { accepted: true, duplicate: true };
+    }
+    await tx.webhookEvent.update({ where: { id: current.id }, data: { lastErrorCode: "EVENT_ID_PAYLOAD_CONFLICT" } });
+    await tx.auditLog.create({ data: {
+      action: "PAYMENT_WEBHOOK_INTEGRITY_CONFLICT",
+      entityType: "WebhookEvent",
+      entityId: current.id,
+      requestId: requestId ?? null,
+      metadata: {
+        provider: incomingProvider,
+        eventId: event.eventId,
+        acceptedPayloadSha256: current.eventData?.payloadSha256 ?? null,
+        conflictingPayloadSha256: payloadSha256,
+      },
+    } });
+    return { accepted: true, duplicate: false, integrityConflict: true, reconciliationRequired: true };
+  };
+  const classifyDuplicateWebhook = async ({ prisma, incomingProvider, event, payloadSha256, requestId, persistedEvent }) => {
+    try {
+      const eventRow = persistedEvent ?? await prisma.webhookEvent.findUnique({
+        where: { provider_providerAccountScope_eventId: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId } },
+      });
+      if (!eventRow) return null;
+      return await prisma.$transaction(async (tx) => {
+        const current = await tx.webhookEvent.findUnique({ where: { id: eventRow.id } });
+        if (!current) throw unavailable();
+        return quarantineWebhookConflict(tx, current, incomingProvider, event, payloadSha256, requestId);
+      });
+    } catch (error) {
+      if (error instanceof ApiError) throw error;
+      throw unavailable();
+    }
+  };
   const currentAdapter = () => {
     if (!enabled) throw unavailable();
     try { return resolvePaymentAdapter({ adapter, provider }); } catch { throw unavailable(); }
@@ -76,7 +125,8 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
     }
     if (reserved.dispatch) await dispatchIntent(reserved.attempt.id, { requestId });
     const latest = reserved.dispatch ? await prisma.paymentAttempt.findUnique({ where: { id: reserved.attempt.id } }).catch(() => reserved.attempt) : reserved.attempt;
-    return { attempt: safeOutcome(latest), accepted: true, idempotent: reserved.idempotent };
+    const checkout = checkoutConfiguration(latest, providerAdapter);
+    return { attempt: safeOutcome(latest), accepted: true, idempotent: reserved.idempotent, ...(checkout ? { checkout } : {}) };
   };
 
   const dispatchIntent = async (attemptId, { requestId } = {}) => {
@@ -133,7 +183,10 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
     const prisma = await getClient();
     const attempt = await prisma.paymentAttempt.findFirst({ where: { id: paymentAttemptId, transaction: { participants: { some: { userId: auth?.userId } } } } });
     if (!attempt) throw denied();
-    return safeOutcome(attempt);
+    let providerAdapter = null;
+    try { providerAdapter = currentAdapter(); } catch { /* read-only status remains available while provider is disabled */ }
+    const checkout = checkoutConfiguration(attempt, providerAdapter);
+    return { ...safeOutcome(attempt), ...(checkout ? { checkout } : {}) };
   };
 
   const verifyPaymentCallback = async ({ auth, paymentAttemptId, orderId, paymentId, signature, requestId }) => {
@@ -230,26 +283,37 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
   const receiveWebhook = async ({ provider: incomingProvider, rawBody, signature, eventId, requestId }) => {
     const providerAdapter = currentAdapter();
     if (providerAdapter.providerId !== incomingProvider || typeof providerAdapter.verifyWebhook !== "function" || typeof providerAdapter.normalizeWebhook !== "function") throw denied();
+    if (!Buffer.isBuffer(rawBody)) throw denied();
     let verified = false;
     try { verified = await providerAdapter.verifyWebhook({ rawBody, signature, receivedAt: now() }); } catch { verified = false; }
     if (!verified) throw denied();
     const event = providerAdapter.normalizeWebhook({ rawBody, headers: { eventId } });
     if (!validNormalizedEvent(event)) throw denied();
+    const payloadSha256 = createHash("sha256").update(rawBody).digest("hex");
     const prisma = await getClient();
+    const priorEvent = await prisma.webhookEvent.findUnique({ where: { provider_providerAccountScope_eventId: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId } } });
+    if (priorEvent) return classifyDuplicateWebhook({ prisma, incomingProvider, event, payloadSha256, requestId, persistedEvent: priorEvent });
     let attempt = await prisma.paymentAttempt.findFirst({ where: { provider: incomingProvider, providerReference: event.providerReference } });
     if (!attempt) {
-      try { await prisma.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: "default", eventId: event.eventId, eventType: event.eventType, status: "IGNORED", eventData: { reason: "UNKNOWN_PAYMENT_REFERENCE" }, processedAt: now() } }); }
-      catch (error) { if (error?.code !== "P2002") throw unavailable(); }
+      try { await prisma.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId, eventType: event.eventType, status: "IGNORED", eventData: { reason: "UNKNOWN_PAYMENT_REFERENCE", payloadSha256 }, processedAt: now() } }); }
+      catch (error) {
+        if (error?.code !== "P2002") throw unavailable();
+        const duplicate = await classifyDuplicateWebhook({ prisma, incomingProvider, event, payloadSha256, requestId });
+        if (duplicate) return duplicate;
+        throw conflict("PAYMENT_EVENT_MISMATCH");
+      }
       return { accepted: true, duplicate: false };
     }
     try {
       return await prisma.$transaction(async (tx) => {
         await lockTransaction(tx, attempt.transactionId);
+        const duplicateEvent = await tx.webhookEvent.findUnique({ where: { provider_providerAccountScope_eventId: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId } } });
+        if (duplicateEvent) return quarantineWebhookConflict(tx, duplicateEvent, incomingProvider, event, payloadSha256, requestId);
         attempt = await tx.paymentAttempt.findUnique({ where: { id: attempt.id } });
         if (!attempt || attempt.provider !== incomingProvider || attempt.providerReference !== event.providerReference
           || attempt.amountMinor.toString() !== event.amountMinor || attempt.currency.trim() !== event.currency) throw conflict("PAYMENT_EVENT_MISMATCH");
         if (event.outcome === "CAPTURED" && incomingProvider === "razorpay" && !event.paymentReference) throw conflict("PAYMENT_EVENT_MISMATCH");
-        const inbox = await tx.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId, eventType: event.eventType, paymentAttemptId: attempt.id, status: "PROCESSING", attemptCount: 1, eventData: { providerReference: event.providerReference, ...(event.paymentReference ? { paymentReference: event.paymentReference } : {}), outcome: event.outcome, final: event.final === true, amountMinor: event.amountMinor, currency: event.currency, noCapture: event.noCapture === true, providerOccurredAt: event.providerOccurredAt } } });
+        const inbox = await tx.webhookEvent.create({ data: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId, eventType: event.eventType, paymentAttemptId: attempt.id, status: "PROCESSING", attemptCount: 1, eventData: { providerReference: event.providerReference, ...(event.paymentReference ? { paymentReference: event.paymentReference } : {}), outcome: event.outcome, final: event.final === true, amountMinor: event.amountMinor, currency: event.currency, noCapture: event.noCapture === true, providerOccurredAt: event.providerOccurredAt, payloadSha256 } } });
         if (attempt.status === "CAPTURED" || ["FAILED", "CANCELLED"].includes(attempt.status)) {
           if (attempt.status === event.outcome) {
             if (attempt.status === "CAPTURED" && attempt.provider === "razorpay") {
@@ -281,12 +345,8 @@ export const createPaymentService = ({ getClient = getPrismaClient, adapter, ena
       });
     } catch (error) {
       if (error?.code === "P2002") {
-        const [persistedEvent, persistedAttempt] = await Promise.all([
-          typeof prisma.webhookEvent.findUnique === "function" ? prisma.webhookEvent.findUnique({ where: { provider_providerAccountScope_eventId: { provider: incomingProvider, providerAccountScope: event.providerAccountScope, eventId: event.eventId } } }).catch(() => null) : null,
-          typeof prisma.paymentAttempt.findUnique === "function" ? prisma.paymentAttempt.findUnique({ where: { id: attempt.id } }).catch(() => null) : null,
-        ]);
-        if (persistedEvent) return { accepted: true, duplicate: true };
-        if (event.outcome === "CAPTURED" && persistedAttempt?.status === "CAPTURED" && persistedAttempt.capturedPaymentId === event.paymentReference) return { accepted: true, duplicate: true };
+        const duplicate = await classifyDuplicateWebhook({ prisma, incomingProvider, event, payloadSha256, requestId });
+        if (duplicate) return duplicate;
         throw conflict("PAYMENT_EVENT_MISMATCH");
       }
       if (error instanceof ApiError) throw error;

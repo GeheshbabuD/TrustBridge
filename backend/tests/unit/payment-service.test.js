@@ -37,7 +37,8 @@ const fixture = () => {
       updateMany: async ({ data }) => { Object.assign(state.outbox, data); return { count: 1 }; },
     },
     webhookEvent: {
-      create: async ({ data }) => { if (state.webhooks.some((event) => event.eventId === data.eventId)) { const error = new Error("duplicate"); error.code = "P2002"; throw error; } const event = { id: `event-${state.webhooks.length}`, ...data }; state.webhooks.push(event); return event; },
+      create: async ({ data }) => { if (state.webhooks.some((event) => event.provider === data.provider && event.providerAccountScope === data.providerAccountScope && event.eventId === data.eventId)) { const error = new Error("duplicate"); error.code = "P2002"; throw error; } const event = { id: `event-${state.webhooks.length}`, ...data }; state.webhooks.push(event); return event; },
+      findUnique: async ({ where }) => state.webhooks.find((event) => event.id === where.id || (event.provider === where.provider_providerAccountScope_eventId?.provider && event.providerAccountScope === where.provider_providerAccountScope_eventId?.providerAccountScope && event.eventId === where.provider_providerAccountScope_eventId?.eventId)) ?? null,
       update: async ({ where, data }) => { const index = state.webhooks.findIndex((event) => event.id === where.id); state.webhooks[index] = { ...state.webhooks[index], ...data }; return state.webhooks[index]; },
     },
     auditLog: { create: async ({ data }) => { state.audits.push(data); return { id: "audit" }; } },
@@ -67,6 +68,19 @@ test("payment initiation reserves persisted terms, idempotency and outbox before
   assert.equal(state.attempt.status, "PENDING");
   assert.equal(state.idempotency.status, "COMPLETED");
   assert.equal(state.outbox.status, "PUBLISHED");
+  assert.equal(JSON.stringify(result).includes("providerReference"), false);
+});
+
+test("Razorpay initiation returns only safe checkout fields after a provider order is persisted", async () => {
+  const { prisma, state } = fixture();
+  prisma.transaction.findUnique = async () => ({ id: transactionId, buyerId, status: "AWAITING_PAYMENT", amountMinor: 5500n, currency: "INR", version: 3 });
+  prisma.transactionTermsVersion.findFirst = async () => ({ id: termsVersionId, status: "ACCEPTED", amountMinor: 5500n, currency: "INR", decisions: [{ actorUserId: buyerId, decision: "ACCEPTED" }, { actorUserId: "seller", decision: "ACCEPTED" }] });
+  const base = createDeterministicPaymentTestAdapter();
+  const adapter = { ...base, providerId: "razorpay", getCheckoutConfiguration: () => ({ key: "rzp_test_public" }) };
+  const service = createPaymentService({ getClient: async () => prisma, adapter, provider: "razorpay", enabled: true });
+  const result = await service.initiate({ auth, transactionId, idempotencyKey: "payment-checkout-001" });
+  assert.deepEqual(result.checkout, { key: "rzp_test_public", order_id: `test_${state.attempt.id}`, amount: 5500, currency: "INR" });
+  assert.equal(JSON.stringify(result).includes("apiSecret"), false);
   assert.equal(JSON.stringify(result).includes("providerReference"), false);
 });
 
@@ -142,6 +156,28 @@ test("duplicate and out-of-order webhook events are idempotent and never regress
   assert.equal(state.webhooks.at(-1).status, "FAILED");
 });
 
+test("a reused webhook event ID with different signed payload is quarantined without replacing accepted evidence", async () => {
+  const { prisma, state } = fixture();
+  state.attempt = { id: "attempt-1", transactionId, provider: "trustbridge-test", providerReference: "ref-1", amountMinor: 5500n, currency: "USD", status: "PENDING" };
+  const adapter = createDeterministicPaymentTestAdapter();
+  const service = createPaymentService({ getClient: async () => prisma, adapter, provider: adapter.providerId, enabled: true });
+  const firstRaw = Buffer.from(JSON.stringify({ eventId: "event-equivocation", providerReference: "ref-1", outcome: "CAPTURED", amountMinor: "5500", currency: "USD" }));
+  const first = await service.receiveWebhook({ provider: adapter.providerId, rawBody: firstRaw, signature: adapter.signTestEvent(firstRaw) });
+  assert.equal(first.status, "CAPTURED");
+  const acceptedData = structuredClone(state.webhooks[0].eventData);
+  const conflictingRaw = Buffer.from(JSON.stringify({ eventId: "event-equivocation", providerReference: "ref-1", outcome: "CAPTURED", amountMinor: "5501", currency: "USD" }));
+  const conflict = await service.receiveWebhook({ provider: adapter.providerId, rawBody: conflictingRaw, signature: adapter.signTestEvent(conflictingRaw), requestId: "request-conflict" });
+  assert.deepEqual(conflict, { accepted: true, duplicate: false, integrityConflict: true, reconciliationRequired: true });
+  assert.equal(state.attempt.status, "CAPTURED");
+  assert.equal(state.webhooks.length, 1);
+  assert.deepEqual(state.webhooks[0].eventData, acceptedData);
+  assert.equal(state.webhooks[0].status, "PROCESSED");
+  assert.equal(state.webhooks[0].lastErrorCode, "EVENT_ID_PAYLOAD_CONFLICT");
+  assert.equal(state.audits.at(-1).action, "PAYMENT_WEBHOOK_INTEGRITY_CONFLICT");
+  assert.notEqual(state.audits.at(-1).metadata.acceptedPayloadSha256, state.audits.at(-1).metadata.conflictingPayloadSha256);
+  assert.equal(JSON.stringify(state.audits).includes(conflictingRaw.toString()), false);
+});
+
 test("nonterminal failure claims are quarantined and cannot satisfy cancellation evidence", async () => {
   const { prisma, state } = fixture();
   state.attempt = { id: "attempt-1", transactionId, provider: "trustbridge-test", providerReference: "ref-1", amountMinor: 5500n, currency: "USD", status: "PENDING" };
@@ -214,4 +250,19 @@ test("checkout signature mismatch or provider amount mismatch cannot mark captur
   const badAdapter = { ...adapter, verifyPaymentSignature: () => false };
   const bad = createPaymentService({ getClient: async () => prisma, adapter: badAdapter, provider: badAdapter.providerId, enabled: true });
   await assert.rejects(bad.verifyPaymentCallback({ auth: { userId: buyerId, authVersion: 4, role: "USER" }, paymentAttemptId: "attempt-1", orderId: "order_1", paymentId: "pay_1", signature: "b".repeat(64) }), (error) => error.statusCode === 404);
+});
+
+test("checkout verification rejects a mismatched order or provider payment reference", async () => {
+  const { prisma, state } = fixture();
+  state.attempt = { id: "attempt-1", transactionId, provider: "razorpay", providerReference: "order_1", amountMinor: 5500n, currency: "INR", status: "PENDING" };
+  prisma.paymentAttempt.findFirst = async () => state.attempt;
+  let fetchCalls = 0;
+  const base = createDeterministicPaymentTestAdapter();
+  const adapter = { ...base, providerId: "razorpay", verifyPaymentSignature: () => true, fetchPaymentDetails: async () => { fetchCalls += 1; return { paymentId: "pay_other", orderId: "order_other", amountMinor: "5500", currency: "INR", status: "captured" }; } };
+  const service = createPaymentService({ getClient: async () => prisma, adapter, provider: "razorpay", enabled: true });
+  await assert.rejects(service.verifyPaymentCallback({ auth, paymentAttemptId: state.attempt.id, orderId: "order_other", paymentId: "pay_other", signature: "a".repeat(64) }), { code: "RESOURCE_NOT_FOUND" });
+  assert.equal(fetchCalls, 0);
+  await assert.rejects(service.verifyPaymentCallback({ auth, paymentAttemptId: state.attempt.id, orderId: "order_1", paymentId: "pay_1", signature: "a".repeat(64) }), { code: "PAYMENT_EVENT_MISMATCH" });
+  assert.equal(state.attempt.status, "PENDING");
+  assert.equal(fetchCalls, 1);
 });

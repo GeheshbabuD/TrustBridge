@@ -10,6 +10,8 @@ import { createRiskBaselineService } from "../services/risk-baseline.service.js"
 import { createAiDisputeService } from "../services/ai-dispute.service.js";
 import { createStepUpAuthorizationMiddleware } from "../middleware/recentMfa.middleware.js";
 import { ApiError } from "../utils/ApiError.js";
+import { disputeAssistanceParamsSchema, emptyRequestBodySchema } from "../validators/ai.validator.js";
+import { validateRequest } from "../middleware/validate.middleware.js";
 
 export const createAiRouter = (dependencies = {}) => {
   const router = Router();
@@ -40,9 +42,10 @@ export const createAiRouter = (dependencies = {}) => {
       ? (_request, _response, next) => next(new ApiError(503, "RATE_LIMIT_STORE_UNAVAILABLE", "Request protection is temporarily unavailable."))
       : (_request, _response, next) => next());
   const disputeStepUp = dependencies.disputeAssistanceStepUpMiddleware ?? createStepUpAuthorizationMiddleware({ purpose: "DISPUTE_REVIEW", resourceIdParam: "disputeId", getClient: dependencies.getClient });
+  const validateDisputeAssistanceInput = validateRequest({ params: disputeAssistanceParamsSchema, body: emptyRequestBodySchema });
 
   router.post("/admin/transactions/:transactionId/risk-assessments", authentication, limiter, requireRole("ADMIN"), recentMfa, controller.assessTransactionRisk);
   router.post("/admin/transactions/:transactionId/risk-baselines", authentication, baselineLimiter, requireRole("ADMIN"), recentMfa, baselineController.assessTransactionRiskBaseline);
-  router.post("/admin/disputes/:disputeId/assistance", authentication, disputeLimiter, requireRole("ADMIN"), disputeStepUp, disputeController.assessDispute);
+  router.post("/admin/disputes/:disputeId/assistance", authentication, disputeLimiter, requireRole("ADMIN"), validateDisputeAssistanceInput, disputeStepUp, disputeController.assessDispute);
   return router;
 };

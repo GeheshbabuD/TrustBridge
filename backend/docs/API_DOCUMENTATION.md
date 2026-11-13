@@ -107,19 +107,19 @@ Responses serialize minor-unit amounts as decimal strings and omit payment attem
 
 ## Payment foundation (TB-BE-038 Phase 2)
 
-- `POST /api/v1/transactions/:transactionId/payment-attempts` requires an authenticated USER who is the persisted BUYER participant and an `Idempotency-Key`. Send an empty JSON object (or an empty body). Amount, currency, provider reference and status are taken from the current persisted accepted terms; client-supplied fields are rejected with `400 VALIDATION_ERROR`. Success is `202` with the safe attempt ID/status, amountMinor string, currency and timestamps. It does not mean the provider captured funds.
+- `POST /api/v1/transactions/:transactionId/payment-attempts` requires an authenticated USER who is the persisted BUYER participant and an `Idempotency-Key`. Send an empty JSON object (or an empty body). Amount, currency, provider reference and status are taken from the current persisted accepted terms; client-supplied fields are rejected with `400 VALIDATION_ERROR`. Success is `202` with the safe attempt ID/status, amountMinor string, currency and timestamps. When an enabled Razorpay adapter has persisted its order, the response also includes `checkout: { key, order_id, amount, currency }`; `key` is the public Razorpay key ID, `order_id` and INR amount come from the persisted attempt, and neither API nor webhook secret is returned. This does not mean the provider captured funds.
 - Repeated identical idempotency keys return the same attempt. Conflicting key reuse or an existing active attempt returns `409`. A missing/unconfigured adapter or provider outage fails closed; an ambiguous provider call remains pending.
-- `GET /api/v1/payment-attempts/:paymentAttemptId` is restricted to persisted transaction participants and returns only safe attempt summary fields.
-- `POST /api/v1/webhooks/:provider` is provider-authenticated through the configured adapter's signature verifier. The server verifies the original request bytes before processing. Invalid signatures and malformed normalized events do not mutate payment state. A verified duplicate is acknowledged idempotently; contradictory/out-of-order terminal events are quarantined for reconciliation. The Razorpay adapter is implemented, but payment enablement and provider eligibility remain deployment-gated. Operation-specific shared rate-limit buckets supplement the global API limit; production fails closed when shared storage is unavailable.
+- `GET /api/v1/payment-attempts/:paymentAttemptId` is restricted to persisted transaction participants and returns only safe attempt summary fields. If the persisted attempt is still pending and its Razorpay order is available, it may also include the same safe `checkout` object; otherwise status retrieval remains available without checkout configuration.
+- `POST /api/v1/webhooks/:provider` is provider-authenticated through the configured adapter's signature verifier. The server verifies the original request bytes before processing. Invalid signatures and malformed normalized events do not mutate payment state or create trusted inbox records. The provider/account/event ID has a database unique constraint. The inbox stores a SHA-256 digest of the signature-verified raw body in its allowlisted `eventData`; identical duplicates are idempotently acknowledged. Reuse of an event ID with different content preserves the originally accepted event data, marks an integrity error and appends a privacy-safe audit alert; the endpoint returns sanitized `202` review acknowledgment, not an ordinary duplicate response. Conflicting content never updates payment or escrow state. The Razorpay adapter is implemented, but payment enablement and provider eligibility remain deployment-gated. Operation-specific shared rate-limit buckets supplement the global API limit; production fails closed when shared storage is unavailable.
 
 ## Razorpay adapter (TB-BE-070)
 
 - When configured with `PAYMENT_PROVIDER=razorpay` and payments explicitly enabled, `POST /api/v1/transactions/:transactionId/payment-attempts` creates a server-side Razorpay Order. Persisted minor units are sent as integer paise and currency must be `INR`; a persisted attempt UUID is the order receipt. Ambiguous creation retries query Razorpay by that receipt before creating again.
 - `POST /api/v1/payment-attempts/:paymentAttemptId/verify` accepts strict `{ "orderId", "paymentId", "signature" }`; server verifies the checkout HMAC, fetches the payment through Razorpay API, checks order/amount/currency and records only a verified captured outcome. It cannot accept a client status claim.
 - Razorpay webhook route uses `X-Razorpay-Signature` on exact raw body and requires `x-razorpay-event-id`. `payment.failed` stays pending until authoritative reconciliation resolves the order; duplicate/out-of-order events use the existing webhook inbox rules.
-- No refund or Route HTTP operation is exposed. Adapter refund/Route methods are disabled unless separately enabled and authorized by an injected financial policy. TB-BE-039 authorization, Razorpay account approval, Route eligibility and legal custody review are still required. A capture is not escrow funding or transaction completion.
+- No refund or Route HTTP operation is exposed. Adapter refund/Route methods are disabled unless separately enabled and authorized by an injected financial policy. TB-BE-039 authorization, Razorpay account approval, Route eligibility and legal custody review are still required. Provider capture is not settlement or transaction completion.
 
-These routes do not fund escrow, post ledger entries, release/refund money, or change transaction completion status. Payment capture remains separate from escrow funding and transaction completion.
+Payment capture, escrow funding, seller release and refund are represented by separate persisted lifecycle records and authorization/execution services; capture does not release/refund money or complete a transaction. **Current implementation limitation:** verified capture processing currently invokes the escrow funding service in the same database transaction and transitions the transaction to `FUNDED` (see TB-BE-048 progress note). This is an internal escrow accounting posting, not verified provider settlement or legal custody. A distinct authoritative settlement-evidence event/gate is not implemented, so production settlement assumptions remain unresolved and must not be inferred from this API response.
 # TB-BE-050 transaction transition policy (2026-11-04)
 
 ## Delivery workflow (TB-BE-050)
@@ -171,3 +171,33 @@ Neither endpoint moves money. No provider execution route is exposed. Final `COM
 ### Blockchain (TB-BE-043)
 
 No public blockchain API is exposed. Approved internal transaction status-history writes may enqueue a hash-only outbox commitment. Chain submission and receipt reconciliation run in a supervised worker; blockchain records are operational metadata only and never alter HTTP authorization, payment, escrow, ledger or dispute decisions.
+
+### Wallet balance/history API (pending accounting design)
+
+Wallet balance and transaction-history endpoints are not implemented. The current ledger has no user-owned wallet accounts; existing postings are transaction-scoped provider clearing and escrow liability. Do not infer available/pending wallet funds from transaction or escrow records. Before implementation, define ownership, posted/pending/reversal semantics, per-currency balances and explicit escrow exclusion. Then add read-only API contracts and tests against the approved wallet ledger source.
+
+### Wallet API (WB-02)
+
+No wallet balance, history, credit, or withdrawal endpoint is exposed. The approved INR/paise policy does not yet identify a verified settlement-to-wallet source. Existing capture is escrow funding; existing Route release can pay the seller directly. Publishing wallet balances before choosing that flow could double-count proceeds. API contracts and authorization tests remain pending the settlement-path decision.
+
+### WB-02A wallet contract status
+
+No wallet endpoint is exposed. The approved architecture keeps direct Route escrow payouts separate and defines independent wallet funding. Future funding, balance/history and withdrawal contracts are documented in `WALLET_ACCOUNTING_DESIGN.md`, but remain unavailable until schema, provider and compliance gates pass.
+
+### WB-02A wallet API status
+
+No wallet endpoint is implemented. Future funding intents must be independent, transaction-linked and owner-authenticated; only verified provider settlement can credit pending balance. Escrow funding and direct Route release never credit wallet. Candidate funding, balance/history and withdrawal contracts are in `WALLET_ACCOUNTING_DESIGN.md`; provider, schema and compliance gates remain open.
+
+## Seller and administrator listing APIs (Phase 3)
+
+`GET /api/v1/sellers?q=<display-name>&limit=25&cursor=<uuid>` requires authentication. Search is case-insensitive over active USER profiles with a non-empty `displayName`. The response contains only `id` and `displayName`; email, account status, preferences, authentication/MFA fields and payment data are excluded. Results sort by display name then user ID. `q` must be 2–80 characters, `limit` is 1–100, and unknown query parameters are rejected.
+
+`GET /api/v1/admin/transactions?status=CREATED&buyerId=<uuid>&sellerId=<uuid>&createdFrom=<ISO-8601>&createdTo=<ISO-8601>&limit=25&cursor=<uuid>` requires authenticated ADMIN and a TOTP assurance timestamp no older than five minutes. Production uses a dedicated shared rate limit; if the shared store is unavailable, the route fails closed. Results sort by `createdAt DESC, id DESC`; fields are transaction ID, buyer/seller IDs, status, integer-minor amount as a decimal string, currency, version and timestamps. Terms, payment attempts, provider references and private data are omitted.
+
+`GET /api/v1/admin/disputes?status=OPEN&limit=25&cursor=<uuid>` has the same ADMIN, recent-TOTP and production shared-rate-limit requirements. Results sort by `createdAt DESC, id DESC` and contain only dispute/transaction/submitter IDs, status, category, timestamps, deadlines and version. Description, resolution text and evidence contents/references are omitted.
+
+All three use the standard success/error envelopes. Invalid/unknown query fields return sanitized 400 `VALIDATION_ERROR`; unauthenticated requests return 401; non-admin or stale/missing TOTP returns 403; storage/shared rate-limit failures fail safely. Admin listing authorization is not a transaction ownership bypass. Example success data: `{ "sellers": [{ "id": "…", "displayName": "Ada" }], "nextCursor": null }`; admin responses use `transactions` or `disputes` with the documented safe projections and `nextCursor`.
+
+## TB-BE-046 API addition
+
+`POST /api/v1/auth/logout-all` requires a valid Bearer access token and accepts no account identifier. It revokes all active refresh sessions belonging to `request.auth.userId` and returns `{success:true,data:{loggedOut:true,revokedCount:number}}`. Existing `POST /auth/logout` continues to revoke a specific presented refresh token; refresh-token reuse continues to revoke the full family. Authenticated requests backed by revoked sessions fail persisted-session validation.

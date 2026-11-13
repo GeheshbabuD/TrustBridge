@@ -30,7 +30,7 @@ const withServer = async (app, run) => {
 
 test("payment initiation HTTP contract rejects client monetary fields and returns safe accepted data", async () => {
   const calls = [];
-  const service = { initiate: async (input) => { calls.push(input); return { accepted: true, attempt: { id: "attempt-safe", status: "PENDING", amountMinor: "5500", currency: "USD" } }; } };
+  const service = { initiate: async (input) => { calls.push(input); return { accepted: true, attempt: { id: "attempt-safe", status: "PENDING", amountMinor: "5500", currency: "INR" }, checkout: { key: "rzp_test_public", order_id: "order_safe", amount: 5500, currency: "INR" } }; } };
   await withServer(createHttpApp({ service, calls }), async (base) => {
     const tampered = await fetch(`${base}/api/v1/transactions/${txId}/payment-attempts`, { method: "POST", headers: { "content-type": "application/json", "idempotency-key": "payment-key-0001" }, body: JSON.stringify({ amountMinor: 1, currency: "EUR", providerReference: "fake", status: "CAPTURED" }) });
     assert.equal(tampered.status, 400);
@@ -39,7 +39,9 @@ test("payment initiation HTTP contract rejects client monetary fields and return
     assert.equal(response.status, 202);
     const body = await response.json();
     assert.equal(body.data.attempt.status, "PENDING");
+    assert.deepEqual(body.data.checkout, { key: "rzp_test_public", order_id: "order_safe", amount: 5500, currency: "INR" });
     assert.equal("providerReference" in body.data.attempt, false);
+    assert.equal(JSON.stringify(body).includes("apiSecret"), false);
     assert.equal(calls[0].auth.userId, auth.userId);
   });
 });
@@ -54,6 +56,19 @@ test("webhook HTTP route passes exact raw bytes to processor and acknowledges du
     assert.equal(received.provider, "trustbridge-test");
     assert.equal(received.rawBody.toString("utf8"), raw);
     assert.equal(received.signature, "test-signature");
+  });
+});
+
+test("conflicting webhook event identity receives a sanitized review acknowledgment", async () => {
+  const service = { receiveWebhook: async () => ({ accepted: true, duplicate: false, integrityConflict: true, reconciliationRequired: true }) };
+  await withServer(createHttpApp({ service, calls: [] }), async (base) => {
+    const raw = '{"event":"payment.captured"}';
+    const response = await fetch(`${base}/api/v1/webhooks/razorpay`, { method: "POST", headers: { "content-type": "application/json", "x-razorpay-signature": "f".repeat(64), "x-razorpay-event-id": "evt-conflict" }, body: raw });
+    assert.equal(response.status, 202);
+    const body = await response.json();
+    assert.deepEqual(body.data, { accepted: true, reconciliationRequired: true });
+    assert.equal(JSON.stringify(body).includes("payloadSha256"), false);
+    assert.equal(JSON.stringify(body).includes("evt-conflict"), false);
   });
 });
 

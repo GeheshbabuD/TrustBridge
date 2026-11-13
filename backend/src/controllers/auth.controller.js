@@ -84,6 +84,14 @@ export const createAuthController = ({ authService = createAuthService(), sessio
     } catch (error) { return forwardServiceError(error, next); }
   },
 
+  logoutAll: async (request, response, next) => {
+    if (!request.auth?.userId) return next(new ApiError(401, "AUTHENTICATION_REQUIRED", "Authentication is required"));
+    try {
+      const result = await sessionService.logoutAll(request.auth.userId);
+      return response.status(200).json({ success: true, message: "All sessions logged out", data: { loggedOut: true, revokedCount: result.revokedCount } });
+    } catch (error) { return forwardServiceError(error, next); }
+  },
+
   mfaEnroll: async (request, response, next) => {
     const parsed = mfaEnrollmentSchema.safeParse(request.body ?? {});
     if (!parsed.success) return next(validationError());

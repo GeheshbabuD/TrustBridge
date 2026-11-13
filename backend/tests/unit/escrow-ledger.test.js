@@ -146,27 +146,104 @@ test("execution lease migration is additive and supports bounded retry claims", 
 });
 
 test("escrow outbox worker uses the operation lease and reschedules ambiguous provider outcomes with persisted reference", async () => {
-  const outboxUpdates = []; const operationUpdates = [];
-  const operation = { id: "op-worker", transactionId: "tx-worker", escrowId: "esc-worker", type: "REFUND", status: "PENDING", amountMinor: 3000n, currency: "INR", operationKey: "REFUND:tx-worker:hash", attemptCount: 0, providerReference: null };
+  const outboxUpdates = []; const operationUpdates = []; let executorCalls = 0;
+  const operation = { id: "11111111-1111-4111-8111-111111111111", transactionId: "22222222-2222-4222-8222-222222222222", escrowId: "esc-worker", type: "REFUND", status: "PENDING", amountMinor: 3000n, currency: "INR", operationKey: "REFUND:tx-worker:hash", attemptCount: 0, providerReference: null };
   const client = {
     outboxEvent: {
-      findMany: async () => [{ id: "event-1", eventKey: "ESCROW_OPERATION:op-worker", payload: { operationId: "op-worker" } }],
+      findMany: async () => [{ id: "event-1", eventKey: `ESCROW_OPERATION:${operation.id}`, eventType: "ESCROW_REFUND_AUTHORIZED", aggregateType: "TRANSACTION", aggregateId: operation.transactionId, transactionId: operation.transactionId, payload: { operationId: operation.id, type: "REFUND", amountMinor: "3000", currency: "INR" } }],
       updateMany: async (args) => { outboxUpdates.push(args); return { count: 1 }; },
     },
     escrowOperation: {
       findUnique: async () => ({ ...operation, transaction: { status: "REFUND_PENDING" } }),
-      updateMany: async (args) => { operationUpdates.push(args); return { count: 1 }; },
+      updateMany: async (args) => { operationUpdates.push(args); Object.assign(operation, args.data); return { count: 1 }; },
     },
   };
   const service = createEscrowService({ getClient: async () => client, refundExecutor: async ({ persistProviderReference }) => {
+    executorCalls += 1;
     await persistProviderReference({ provider: "razorpay", providerReference: "rfnd_1" });
     return { verified: false, outcome: "PENDING", provider: "razorpay", providerReference: "rfnd_1" };
   } });
-  assert.deepEqual(await service.processOutboxBatch(), { claimed: 1, processed: 0, deferred: 1 });
-  assert.equal(operationUpdates.length, 3); // claim, durable provider ID, lease release
+  assert.deepEqual(await service.processOutboxBatch(), { claimed: 1, processed: 0, deferred: 1, failed: 0 });
+  assert.equal(executorCalls, 2); // initial outcome followed by a reference-bound reconciliation
+  assert.equal(operationUpdates.length, 6);
   assert.equal(operationUpdates[1].data.providerReference, "rfnd_1");
   assert.equal(operationUpdates[1].data.status, undefined);
   assert.equal(outboxUpdates.at(-1).data.status, "PENDING");
+  assert.equal(outboxUpdates.at(-1).data.lastErrorCode, "PROVIDER_OUTCOME_PENDING");
+});
+
+test("structurally invalid escrow outbox events become retained terminal failures and cannot replay", async () => {
+  const operation = { id: "11111111-1111-4111-8111-111111111111", transactionId: "22222222-2222-4222-8222-222222222222", type: "RELEASE", amountMinor: 5000n, currency: "INR" };
+  const row = { id: "event-invalid", eventKey: `ESCROW_OPERATION:${operation.id}`, eventType: "ESCROW_RELEASE_AUTHORIZED", aggregateType: "TRANSACTION", aggregateId: operation.transactionId, transactionId: operation.transactionId, payload: { operationId: operation.id, type: "RELEASE", amountMinor: "5001", currency: "INR" }, status: "PENDING", leaseOwner: null };
+  const updates = []; let executions = 0;
+  const client = {
+    outboxEvent: {
+      findMany: async () => row.status === "FAILED" ? [] : [row],
+      updateMany: async ({ where, data }) => {
+        if (where.id !== row.id || (data.status === "PROCESSING" && !["PENDING", "PROCESSING"].includes(row.status)) || (where.leaseOwner && row.leaseOwner !== where.leaseOwner)) return { count: 0 };
+        Object.assign(row, data); updates.push(data); return { count: 1 };
+      },
+    },
+    escrowOperation: { findUnique: async () => operation, updateMany: async () => ({ count: 1 }) },
+  };
+  const service = createEscrowService({ getClient: async () => client, releaseExecutor: async () => { executions += 1; return { verified: false }; } });
+  assert.deepEqual(await service.processOutboxBatch(), { claimed: 1, processed: 0, deferred: 0, failed: 1 });
+  assert.equal(row.status, "FAILED");
+  assert.equal(row.lastErrorCode, "ESCROW_OUTBOX_INVALID_EVENT");
+  assert.equal(row.leaseOwner, null);
+  assert.equal(row.leaseExpiresAt, null);
+  assert.equal(executions, 0);
+  assert.deepEqual(await service.processOutboxBatch(), { claimed: 0, processed: 0, deferred: 0, failed: 0 });
+  assert.equal(executions, 0);
+});
+
+test("transient database failure keeps escrow outbox work pending on the existing retry schedule", async () => {
+  const transactionId = "22222222-2222-4222-8222-222222222222";
+  const row = { id: "event-transient", eventKey: "ESCROW_OPERATION:11111111-1111-4111-8111-111111111111", eventType: "ESCROW_RELEASE_AUTHORIZED", aggregateType: "TRANSACTION", aggregateId: transactionId, transactionId, payload: { operationId: "11111111-1111-4111-8111-111111111111", type: "RELEASE", amountMinor: "5000", currency: "INR" }, status: "PENDING" };
+  const updates = []; let executions = 0;
+  const client = {
+    outboxEvent: { findMany: async () => [row], updateMany: async ({ data }) => { updates.push(data); Object.assign(row, data); return { count: 1 }; } },
+    escrowOperation: { findUnique: async () => { throw new Error("database unavailable"); } },
+  };
+  const service = createEscrowService({ getClient: async () => client, now: () => new Date("2026-01-02T00:00:00.000Z"), releaseExecutor: async () => { executions += 1; } });
+  assert.deepEqual(await service.processOutboxBatch(), { claimed: 1, processed: 0, deferred: 1, failed: 0 });
+  assert.equal(row.status, "PENDING");
+  assert.equal(row.lastErrorCode, "ESCROW_WORKER_RETRY");
+  assert.equal(row.nextAttemptAt.toISOString(), "2026-01-02T00:01:00.000Z");
+  assert.equal(row.leaseOwner, null);
+  assert.equal(executions, 0);
+});
+
+test("expired escrow outbox leases are reclaimable once and competing claims defer without provider execution", async () => {
+  const operation = { id: "11111111-1111-4111-8111-111111111111", transactionId: "22222222-2222-4222-8222-222222222222", type: "RELEASE", amountMinor: 5000n, currency: "INR", status: "PENDING", attemptCount: 0, providerReference: null };
+  const now = () => new Date("2026-01-02T00:00:00.000Z");
+  const row = { id: "event-expired", eventKey: `ESCROW_OPERATION:${operation.id}`, eventType: "ESCROW_RELEASE_AUTHORIZED", aggregateType: "TRANSACTION", aggregateId: operation.transactionId, transactionId: operation.transactionId, payload: { operationId: operation.id, type: "RELEASE", amountMinor: "5000", currency: "INR" }, status: "PROCESSING", leaseOwner: "expired-owner", leaseExpiresAt: new Date("2026-01-01T23:59:00.000Z"), nextAttemptAt: new Date("2026-01-01T23:59:00.000Z") };
+  const claims = []; let providerCalls = 0;
+  const makeClient = () => ({
+    outboxEvent: {
+      findMany: async () => [row],
+      updateMany: async ({ where, data }) => {
+        if (data.status === "PROCESSING") {
+          const eligible = (row.status === "PENDING" && row.nextAttemptAt <= where.OR[0].status.nextAttemptAt.lte)
+            || (row.status === "PROCESSING" && row.leaseExpiresAt <= where.OR[1].leaseExpiresAt.lte);
+          if (!eligible) return { count: 0 };
+          Object.assign(row, data); claims.push(data.leaseOwner); return { count: 1 };
+        }
+        if (row.status !== "PROCESSING" || row.leaseOwner !== where.leaseOwner) return { count: 0 };
+        Object.assign(row, data); return { count: 1 };
+      },
+    },
+    escrowOperation: { findUnique: async () => operation, updateMany: async () => ({ count: 0 }) },
+  });
+  const serviceA = createEscrowService({ getClient: async () => makeClient(), now, releaseExecutor: async () => { providerCalls += 1; } });
+  const serviceB = createEscrowService({ getClient: async () => makeClient(), now, releaseExecutor: async () => { providerCalls += 1; } });
+  const results = await Promise.all([serviceA.processOutboxBatch(), serviceB.processOutboxBatch()]);
+  assert.equal(claims.length, 1);
+  assert.equal(results.reduce((sum, result) => sum + result.claimed, 0), 1);
+  assert.equal(results.reduce((sum, result) => sum + result.deferred, 0), 1);
+  assert.equal(row.status, "PENDING");
+  assert.equal(row.lastErrorCode, "PROVIDER_OUTCOME_PENDING");
+  assert.equal(providerCalls, 0);
 });
 
 test("authoritative terminal provider failure restores the funded pre-operation state without posting a journal", async () => {

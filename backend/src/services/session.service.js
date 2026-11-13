@@ -128,5 +128,17 @@ export const createSessionService = ({
     });
   };
 
-  return Object.freeze({ issueForUser, refresh, logout });
+  // The caller must supply the user ID from a server-verified access session;
+  // this operation never accepts an account identifier from request data.
+  const logoutAll = async (userId) => {
+    if (typeof userId !== "string" || !userId) throw new TypeError("Authenticated user ID is required");
+    const client = await getClient();
+    const result = await client.refreshToken.updateMany({
+      where: { userId, revokedAt: null },
+      data: { revokedAt: now(), revocationReason: "logout_all", lastUsedAt: now() },
+    });
+    return { revokedCount: result.count };
+  };
+
+  return Object.freeze({ issueForUser, refresh, logout, logoutAll });
 };

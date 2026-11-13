@@ -3,11 +3,32 @@ import { getPrismaClient } from "../config/db.js";
 import { ApiError } from "../utils/ApiError.js";
 import { enqueueTransactionNotice } from "./notification-event.service.js";
 import { enqueueBlockchainStatusCommitment } from "./blockchain-event-hash.service.js";
+import { createLedgerReconciliationService } from "./ledger-reconciliation.service.js";
 
 const unavailable = () => new ApiError(503, "ESCROW_UNAVAILABLE", "Escrow service is temporarily unavailable");
 const denied = () => new ApiError(404, "RESOURCE_NOT_FOUND", "Resource not found");
 const conflict = (code = "ESCROW_CONFLICT") => new ApiError(409, code, "Escrow operation conflicts with current state");
 const safeEscrow = (row) => ({ id: row.id, transactionId: row.transactionId, status: row.status, balanceMinor: row.balanceMinor.toString(), currency: row.currency.trim() });
+const escrowEventTypes = Object.freeze({ RELEASE: "ESCROW_RELEASE_AUTHORIZED", REFUND: "ESCROW_REFUND_AUTHORIZED" });
+const isUuid = (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+const hasValidEscrowEventBinding = (event, operation) => {
+  const payload = event?.payload;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || !isUuid(payload.operationId) || !operation) return false;
+  return event.eventKey === `ESCROW_OPERATION:${payload.operationId}`
+    && event.eventType === escrowEventTypes[operation.type]
+    && event.aggregateType === "TRANSACTION"
+    && isUuid(event.transactionId)
+    && event.aggregateId === event.transactionId
+    && operation.transactionId === event.transactionId
+    && payload.type === operation.type
+    && typeof operation.amountMinor === "bigint"
+    && typeof operation.currency === "string"
+    && typeof payload.amountMinor === "string"
+    && /^[1-9][0-9]*$/.test(payload.amountMinor)
+    && payload.amountMinor === operation.amountMinor.toString()
+    && typeof payload.currency === "string"
+    && payload.currency === operation.currency.trim();
+};
 
 const lockTransaction = (tx, id) => tx.$queryRaw`SELECT "id" FROM "transactions" WHERE "id" = ${id}::uuid FOR UPDATE`;
 const audit = (tx, actorUserId, action, transactionId, requestId, metadata) => tx.auditLog.create({ data: { actorUserId, action, entityType: "TRANSACTION", entityId: transactionId, requestId, metadata } });
@@ -33,6 +54,7 @@ const postJournal = async (tx, { transactionId, currency, amountMinor, operation
 };
 
 export const createEscrowService = ({ getClient = getPrismaClient, now = () => new Date(), releaseExecutor, refundExecutor } = {}) => {
+  const ledgerReconciliation = createLedgerReconciliationService({ getClient });
   // Called only by the verified payment service while it holds the transaction row lock.
   const recordVerifiedFunding = async ({ tx, paymentAttempt, actorUserId = null, requestId = null }) => {
     try {
@@ -279,12 +301,12 @@ export const createEscrowService = ({ getClient = getPrismaClient, now = () => n
       ...(typeof releaseExecutor === "function" ? ["ESCROW_RELEASE_AUTHORIZED"] : []),
       ...(typeof refundExecutor === "function" ? ["ESCROW_REFUND_AUTHORIZED"] : []),
     ];
-    if (!enabledTypes.length) return { claimed: 0, processed: 0, deferred: 0 };
+    if (!enabledTypes.length) return { claimed: 0, processed: 0, deferred: 0, failed: 0 };
     const prisma = await getClient(); const stamp = now();
     const candidates = await prisma.outboxEvent.findMany({ where: { eventType: { in: enabledTypes }, OR: [
       { status: "PENDING", nextAttemptAt: { lte: stamp } }, { status: "PROCESSING", leaseExpiresAt: { lte: stamp } },
-    ] }, orderBy: [{ nextAttemptAt: "asc" }, { createdAt: "asc" }], take: limit, select: { id: true, eventKey: true, payload: true } });
-    let claimedCount = 0; let processed = 0; let deferred = 0;
+    ] }, orderBy: [{ nextAttemptAt: "asc" }, { createdAt: "asc" }], take: limit, select: { id: true, eventKey: true, eventType: true, aggregateType: true, aggregateId: true, transactionId: true, payload: true } });
+    let claimedCount = 0; let processed = 0; let deferred = 0; let failed = 0;
     for (const event of candidates) {
       const leaseOwner = randomUUID(); const claimedAt = now();
       const claim = await prisma.outboxEvent.updateMany({ where: { id: event.id, OR: [
@@ -292,11 +314,29 @@ export const createEscrowService = ({ getClient = getPrismaClient, now = () => n
       ] }, data: { status: "PROCESSING", attemptCount: { increment: 1 }, claimedAt, leaseOwner, leaseExpiresAt: new Date(claimedAt.getTime() + 60_000) } });
       if (claim.count !== 1) continue;
       claimedCount += 1;
+      let operation;
+      let permanentlyInvalid = false;
       try {
         const operationId = event.payload?.operationId;
-        if (typeof operationId !== "string") throw unavailable();
-        let outcome = await executeAuthorizedOperation({ operationId });
-        if (outcome.status === "PENDING" && outcome.reconciliationRequired) outcome = await executeAuthorizedOperation({ operationId, reconcileOnly: true });
+        if (!isUuid(operationId)) permanentlyInvalid = true;
+        else {
+          operation = await prisma.escrowOperation.findUnique({ where: { id: operationId }, select: { id: true, type: true, transactionId: true, amountMinor: true, currency: true } });
+          permanentlyInvalid = !hasValidEscrowEventBinding(event, operation);
+        }
+      } catch {
+        await prisma.outboxEvent.updateMany({ where: { id: event.id, status: "PROCESSING", leaseOwner }, data: { status: "PENDING", nextAttemptAt: new Date(now().getTime() + 60_000), leaseOwner: null, leaseExpiresAt: null, lastErrorCode: "ESCROW_WORKER_RETRY" } }).catch(() => {});
+        deferred += 1;
+        continue;
+      }
+      if (permanentlyInvalid) {
+        const terminal = await prisma.outboxEvent.updateMany({ where: { id: event.id, status: "PROCESSING", leaseOwner }, data: { status: "FAILED", leaseOwner: null, leaseExpiresAt: null, lastErrorCode: "ESCROW_OUTBOX_INVALID_EVENT" } });
+        if (terminal.count === 1) failed += 1;
+        else deferred += 1;
+        continue;
+      }
+      try {
+        let outcome = await executeAuthorizedOperation({ operationId: operation.id });
+        if (outcome.status === "PENDING" && outcome.reconciliationRequired) outcome = await executeAuthorizedOperation({ operationId: operation.id, reconcileOnly: true });
         if (["SUCCEEDED", "FAILED"].includes(outcome.status)) {
           const done = await prisma.outboxEvent.updateMany({ where: { id: event.id, status: "PROCESSING", leaseOwner }, data: { status: "PUBLISHED", publishedAt: now(), leaseOwner: null, leaseExpiresAt: null, lastErrorCode: null } });
           if (done.count !== 1) throw unavailable();
@@ -310,7 +350,7 @@ export const createEscrowService = ({ getClient = getPrismaClient, now = () => n
         deferred += 1;
       }
     }
-    return { claimed: claimedCount, processed, deferred };
+    return { claimed: claimedCount, processed, deferred, failed };
   };
 
   const reconcilePendingOperations = async ({ limit = 20 } = {}) => {
@@ -327,5 +367,5 @@ export const createEscrowService = ({ getClient = getPrismaClient, now = () => n
     return { checked: results.length, results };
   };
 
-  return Object.freeze({ recordVerifiedFunding, authorizeRelease, authorizeRefund, executeAuthorizedOperation, processOutboxBatch, reconcilePendingOperations, getOperationStatus, getStatus });
+  return Object.freeze({ recordVerifiedFunding, authorizeRelease, authorizeRefund, executeAuthorizedOperation, processOutboxBatch, reconcilePendingOperations, reconcileLedger: ledgerReconciliation.reconcileTransaction, getOperationStatus, getStatus });
 };

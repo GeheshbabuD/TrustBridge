@@ -63,6 +63,12 @@ export const createRazorpayPaymentAdapter = ({
   const adapter = {
     providerId: "razorpay",
     capabilities: Object.freeze({ idempotentIntentCreation: true, signedWebhooks: true, statusLookup: true }),
+    getCheckoutConfiguration() {
+      if (!enabled || !identifier.test(apiKey ?? "")) throw safeError();
+      // Razorpay's key ID is intentionally public checkout configuration. The
+      // API secret and webhook secret are never returned by this method.
+      return Object.freeze({ key: apiKey });
+    },
     async createPaymentIntent({ attemptId, amountMinor, currency }) {
       const amount = safeMinor(amountMinor);
       if (!identifier.test(attemptId) || amount === null || currency !== "INR") throw safeError();

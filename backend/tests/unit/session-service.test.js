@@ -112,6 +112,24 @@ test("logout is idempotent for known, repeated and unknown token values", async 
   assert.equal(store.rows[0].revocationReason, "logout");
 });
 
+test("logoutAll revokes every active session for the authenticated account only", async () => {
+  const store = makeStore();
+  const sessions = serviceFor(store);
+  const first = await sessions.issueForUser("user-1");
+  const second = await sessions.issueForUser("user-1");
+  await sessions.issueForUser("user-1");
+  store.rows[2].userId = "another-user";
+  store.rows[2].revokedAt = new Date("2025-12-31T00:00:00Z");
+
+  const result = await sessions.logoutAll("user-1");
+  assert.deepEqual(result, { revokedCount: 2 });
+  assert.equal(store.rows[0].revocationReason, "logout_all");
+  assert.equal(store.rows[1].revocationReason, "logout_all");
+  assert.equal(store.rows[2].revocationReason, undefined);
+  await assert.rejects(sessions.refresh(first.refreshToken), { code: "INVALID_REFRESH_TOKEN" });
+  await assert.rejects(sessions.refresh(second.refreshToken), { code: "INVALID_REFRESH_TOKEN" });
+});
+
 test("concurrent refresh attempts allow one rotation and treat the loser as replay", async () => {
   const store = makeStore();
   const sessions = serviceFor(store);

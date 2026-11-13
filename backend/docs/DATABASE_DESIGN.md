@@ -208,3 +208,15 @@ TB-BE-041 reuses the existing `Notification` unique recipient/dedupe key and dur
 ## Blockchain persistence use (TB-BE-043)
 
 The implementation reuses `BlockchainRecord` and `OutboxEvent`; no migration was needed. Transaction status-history versions create a unique `(transactionId, idempotencyKey)` record with only the 64-character event hash, network/contract references and safe state. The outbox payload contains only the BlockchainRecord ID. Ethers transaction/block references and reconciliation state are written to existing columns. A mined transaction hash is not treated as confirmation; canonical receipt/event/hash and configured confirmations are required. No DB migration or database operation occurred for TB-BE-043.
+
+### WB-02 wallet schema status
+
+No wallet schema has been applied or proposed as migration SQL. The design direction is additive and transaction-linked: user/transaction/INR `WalletAccount` ownership plus bucket-classified wallet accounts attached to the existing transaction-scoped ledger, keeping existing escrow ledger rows intact. Actual Prisma fields, checks, indexes and migration SQL are gated on deciding whether seller proceeds credit a wallet before withdrawal or continue to be paid directly through Route. No incomplete wallet endpoints are documented as available.
+
+### WB-02A approved architecture
+
+Escrow Route release remains direct to seller and never produces wallet credit. The wallet is separately funded; capture alone cannot post pending credit, and only verified provider settlement may do so. The reconciled design (see `WALLET_ACCOUNTING_DESIGN.md`) proposes extending the existing ledger's scope rather than adding a competing ledger. No wallet routes are available. WB-02 implementation remains blocked on funding provider/capabilities, top-up legality/custody, settlement finality, withdrawal/destination provider and reversal policy.
+
+### WB-02A schema direction
+
+Wallet design is transaction-linked and can reuse existing transaction-scoped `LedgerJournal`/`LedgerEntry`; proposed additions are an owner/transaction/INR `WalletAccount`, optional wallet/bucket scope on `LedgerAccount`, and funding/withdrawal operation records with unique provider/idempotency references. Existing escrow rows remain unchanged and outside wallet projections. No Prisma changes or migration exist. Exact constraints/triggers and migration SQL require provider/accounting decisions and isolated validation.

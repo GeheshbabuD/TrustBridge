@@ -1,7 +1,7 @@
 import express from "express";
 import helmet from "helmet";
 import { getEnv } from "./config/env.js";
-import { connectDatabase } from "./config/db.js";
+import { connectDatabase, getPrismaClient } from "./config/db.js";
 import { createCorsMiddleware } from "./middleware/cors.middleware.js";
 import { errorHandler } from "./middleware/error.middleware.js";
 import { notFoundHandler } from "./middleware/notFound.middleware.js";
@@ -18,8 +18,9 @@ import { createNotificationOutboxWorker } from "./workers/notification-outbox.wo
 import { createBlockchainService } from "./services/blockchain.service.js";
 import { createBlockchainOutboxWorker } from "./workers/blockchain-outbox.worker.js";
 import { createEthersBlockchainAdapter } from "./services/ethers-blockchain.adapter.js";
+import { createOperationalMetricsAdapter, createOutboxMetricsCollector } from "./services/operational-metrics.adapter.js";
 
-export const createApp = (environment = getEnv(), { writeLog, authService, sessionService, mfaService, userService, notificationService, emailAdapter, paymentService, paymentAdapter, escrowService, escrowServiceOptions, resolveRouteAccount, disputeService, evidenceStorage, aiService, aiAdapter, blockchainAdapter, blockchainSigner, blockchainService, aiRateLimiter, recentMfaMiddleware, mfaEncryptionProvider, authenticationMiddleware, mfaVerificationRateLimiter, authLoginRateLimiter, authRegistrationRateLimiter, mfaChallengeRateLimiter, mfaStepUpCreateRateLimiter, mfaStepUpVerifyRateLimiter, rateLimitStore: injectedRateLimitStore, stepUpPurposes, stepUpAuthorizationMiddlewareFactory, verifyIndependentIdentity, deliverLegacyAdminEnrollmentAuthorization, checkDatabase = connectDatabase } = {}) => {
+export const createApp = (environment = getEnv(), { writeLog, authService, sessionService, mfaService, userService, notificationService, emailAdapter, paymentService, paymentAdapter, escrowService, escrowServiceOptions, resolveRouteAccount, disputeService, evidenceStorage, aiService, aiAdapter, blockchainAdapter, blockchainSigner, blockchainService, aiRateLimiter, recentMfaMiddleware, mfaEncryptionProvider, operationalAlertAdapter, operationalMetrics, authenticationMiddleware, mfaVerificationRateLimiter, authLoginRateLimiter, authRegistrationRateLimiter, mfaChallengeRateLimiter, mfaStepUpCreateRateLimiter, mfaStepUpVerifyRateLimiter, rateLimitStore: injectedRateLimitStore, stepUpPurposes, stepUpAuthorizationMiddlewareFactory, verifyIndependentIdentity, deliverLegacyAdminEnrollmentAuthorization, checkDatabase = connectDatabase } = {}) => {
   const app = express();
 
   const activeMfaService = mfaService ?? ((environment.nodeEnv === "production" || mfaEncryptionProvider)
@@ -28,6 +29,11 @@ export const createApp = (environment = getEnv(), { writeLog, authService, sessi
 
   app.set("env", environment.nodeEnv);
   app.set("trust proxy", false);
+  if (operationalAlertAdapter !== undefined) app.locals.operationalAlertAdapter = operationalAlertAdapter;
+  const activeOperationalMetrics = operationalMetrics ?? createOperationalMetricsAdapter();
+  for (const method of ["increment", "gauge", "observe", "snapshot"]) if (typeof activeOperationalMetrics[method] !== "function") throw new TypeError("Operational metrics adapter is invalid");
+  app.locals.operationalMetrics = activeOperationalMetrics;
+  app.locals.collectOutboxMetrics = createOutboxMetricsCollector({ getClient: getPrismaClient, metrics: activeOperationalMetrics });
   const rateLimitStore = injectedRateLimitStore ?? (environment.nodeEnv === "test" ? new MemoryRateLimitStore() : getRateLimitStore(environment.rateLimit));
   const rateLimitOptions = {
     windowMs: environment.rateLimit.windowMs,
@@ -86,27 +92,36 @@ export const createApp = (environment = getEnv(), { writeLog, authService, sessi
     }
     const workerStatus = Object.fromEntries(["notificationWorker", "escrowWorker", "blockchainWorker"].map((key) => {
       const worker = app.locals[key];
-      if (!worker) return [key.replace("Worker", ""), { state: "disabled" }];
+      if (!worker) return [key.replace("Worker", ""), {
+        state: "disabled",
+        consecutiveFailures: 0,
+        lastSuccessAt: null,
+        lastFailureAt: null,
+        lastErrorCode: null,
+        required: false,
+      }];
+      const lifecycleWorker = app.locals.lifecycleStatus?.workers?.[key.replace("Worker", "")];
       let value;
       try {
-        const lifecycleWorker = app.locals.lifecycleStatus?.workers?.[key.replace("Worker", "")];
         value = lifecycleWorker?.state === "failed" || lifecycleWorker?.state === "drain_timeout"
           ? lifecycleWorker : (typeof worker.getStatus === "function" ? worker.getStatus() : lifecycleWorker ?? { state: "unknown" });
       } catch { value = { state: "unknown" }; }
       return [key.replace("Worker", ""), {
-        state: ["running", "degraded", "stopping", "stopped", "failed", "drain_timeout"].includes(value.state) ? value.state : "unknown",
+        state: ["running", "degraded", "stopping", "stopped", "failed", "drain_timeout", "disabled"].includes(value.state) ? value.state : "unknown",
         consecutiveFailures: Number.isSafeInteger(value.consecutiveFailures) && value.consecutiveFailures >= 0 ? value.consecutiveFailures : 0,
         lastSuccessAt: typeof value.lastSuccessAt === "string" ? value.lastSuccessAt : null,
         lastFailureAt: typeof value.lastFailureAt === "string" ? value.lastFailureAt : null,
         lastErrorCode: ["WORKER_RUN_FAILED", "WORKER_START_FAILED", "WORKER_STOP_FAILED", "DRAIN_TIMEOUT"].includes(value.lastErrorCode) ? value.lastErrorCode : null,
+        required: lifecycleWorker ? lifecycleWorker.required === true : key === "escrowWorker" && Boolean(worker),
       }];
     }));
+    const requiredWorkersHealthy = Object.values(workerStatus).every((worker) => !worker.required || worker.state === "running");
     const checks = {
       database: databaseAvailable ? "available" : "unavailable",
       rateLimitStore: rateLimitHealth.available ? (rateLimitHealth.shared ? "available" : "process_local") : "unavailable",
       mfaEncryption: environment.nodeEnv === "production" ? (kmsAvailable ? "available" : "unavailable") : "not_required",
     };
-    const ready = databaseAvailable && rateLimitHealth.available
+    const ready = databaseAvailable && rateLimitHealth.available && requiredWorkersHealthy
       && (environment.nodeEnv !== "production" || (rateLimitHealth.shared === true && kmsAvailable));
     response.status(ready ? 200 : 503).json({
       success: ready,

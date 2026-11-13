@@ -5,6 +5,7 @@ import { startServer } from "../../src/server.js";
 import { createApp } from "../../src/app.js";
 import { getEnv } from "../../src/config/env.js";
 import { createNotificationOutboxWorker } from "../../src/workers/notification-outbox.worker.js";
+import { createOperationalAlertAdapter } from "../../src/services/operational-alert.adapter.js";
 
 process.env.NODE_ENV = "test";
 process.env.DATABASE_URL = "postgresql://synthetic:synthetic@localhost:5432/trustbridge_test";
@@ -74,6 +75,69 @@ test("worker startup failure is exposed as sanitized readiness status, not made 
   } finally { await shutdown(); }
 });
 
+test("required escrow worker startup failure makes readiness unhealthy while liveness stays healthy", async () => {
+  const alerts = [];
+  const app = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => true });
+  app.locals.notificationWorker = null;
+  app.locals.escrowWorker = { start() { throw new Error("private provider URL and secret"); }, getStatus: () => ({ state: "stopped" }) };
+  const { server, shutdown } = startServer(0, { appInstance: app, operationalAlertAdapter: { notify: async (alert) => alerts.push(alert) } });
+  await once(server, "listening");
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const ready = await fetch(`${base}/health/ready`);
+    const payload = await ready.json();
+    assert.equal(ready.status, 503);
+    assert.equal(payload.data.status, "not_ready");
+    assert.equal(payload.data.workers.escrow.required, true);
+    assert.equal(payload.data.workers.escrow.state, "failed");
+    assert.equal((await fetch(`${base}/health/live`)).status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(alerts.map(({ type, worker, required }) => ({ type, worker, required })), [{ type: "WORKER_UNAVAILABLE", worker: "escrow", required: true }]);
+    assert.equal(app.locals.operationalMetrics.snapshot().some((metric) => metric.name === "worker_state" && metric.labels.worker === "escrow" && metric.labels.state === "failed" && metric.value === 1), true);
+    assert.doesNotMatch(JSON.stringify({ ...payload, alerts }), /private provider URL|secret/);
+  } finally { await shutdown(); }
+});
+
+test("runtime worker degradation and recovery update readiness and emit sanitized transitions", async () => {
+  const alerts = []; let status; let report;
+  const app = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => true });
+  app.locals.notificationWorker = null;
+  app.locals.escrowWorker = {
+    start({ onStatusChange }) { report = onStatusChange; status = { state: "running", consecutiveFailures: 0 }; report(status); return async () => {}; },
+    getStatus() { return status; },
+  };
+  const { server, shutdown } = startServer(0, { appInstance: app, operationalAlertAdapter: { notify: async (alert) => alerts.push(alert) } });
+  await once(server, "listening");
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    assert.equal((await fetch(`${base}/health/ready`)).status, 200);
+    status = { state: "degraded", consecutiveFailures: 1, lastFailureAt: new Date().toISOString(), lastErrorCode: "WORKER_RUN_FAILED" };
+    report(status);
+    const degraded = await fetch(`${base}/health/ready`);
+    const degradedPayload = await degraded.json();
+    assert.equal(degraded.status, 503);
+    assert.equal(degradedPayload.data.workers.escrow.state, "degraded");
+    assert.equal((await fetch(`${base}/health/live`)).status, 200);
+    status = { state: "running", consecutiveFailures: 0, lastSuccessAt: new Date().toISOString() };
+    report(status);
+    assert.equal((await fetch(`${base}/health/ready`)).status, 200);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(alerts.map((alert) => alert.type), ["WORKER_UNAVAILABLE", "WORKER_RECOVERED"]);
+    assert.equal(alerts.every((alert) => alert.worker === "escrow" && alert.required === true), true);
+    assert.doesNotMatch(JSON.stringify(alerts), /transactionId|payment|stack|secret|credential/i);
+  } finally { await shutdown(); }
+});
+
+test("operational alert delivery failure is sanitized and does not throw", async () => {
+  const logs = [];
+  const adapter = createOperationalAlertAdapter({ send: async () => { throw new Error("private alert endpoint credential"); }, writeLog: (record) => logs.push(record) });
+  assert.equal(await adapter.notify({ type: "WORKER_UNAVAILABLE", worker: "escrow", state: "degraded", required: true, lastErrorCode: "WORKER_RUN_FAILED", details: "sensitive transaction data" }), false);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].event, "operational_alert_delivery_failed");
+  assert.equal(logs[0].errorCode, "ALERT_DELIVERY_FAILED");
+  assert.doesNotMatch(JSON.stringify(logs), /private alert endpoint|credential|sensitive transaction data/);
+});
+
 test("repeated shutdown calls share one bounded shutdown operation", async () => {
   let stops = 0;
   const app = bareApp({ blockchainWorker: { start() { return async () => { stops += 1; }; } } });
@@ -85,15 +149,27 @@ test("repeated shutdown calls share one bounded shutdown operation", async () =>
   assert.equal(stops, 1);
 });
 
+test("server injects internal metrics adapters into supervised workers", async () => {
+  let received;
+  const metrics = { increment() {}, gauge() {}, observe() {}, snapshot() { return []; } };
+  const collector = { async collect() { return true; } };
+  const app = bareApp({ operationalMetrics: metrics, collectOutboxMetrics: collector, notificationWorker: { start(options) { received = options; return async () => {}; } } });
+  const { server, shutdown } = startServer(0, { appInstance: app });
+  await once(server, "listening");
+  assert.strictEqual(received.metrics, metrics);
+  assert.strictEqual(received.collectOutboxMetrics, collector);
+  await shutdown();
+});
+
 test("worker runtime failures and recovery expose only sanitized status", async () => {
-  let calls = 0;
+  let calls = 0; const statusChanges = [];
   let tick;
   const worker = createNotificationOutboxWorker({
     notificationService: { async processOutboxBatch() { calls += 1; if (calls === 1) throw new Error("private provider response"); return { processed: 1 }; } },
     setIntervalFn: (callback) => { tick = callback; return { unref() {} }; },
     clearIntervalFn: () => {},
   });
-  worker.start();
+  worker.start({ onStatusChange: (status) => statusChanges.push(status.state) });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(worker.getStatus().state, "degraded");
   assert.equal(worker.getStatus().lastErrorCode, "WORKER_RUN_FAILED");
@@ -102,5 +178,6 @@ test("worker runtime failures and recovery expose only sanitized status", async 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(worker.getStatus().state, "running");
   assert.equal(worker.getStatus().consecutiveFailures, 0);
+  assert.deepEqual(statusChanges, ["running", "degraded", "running"]);
   await worker.stop();
 });

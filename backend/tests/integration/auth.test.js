@@ -245,6 +245,37 @@ test("refresh rotates a valid refresh token and logout is idempotent", async () 
   });
 });
 
+test("logout-all requires authentication and revokes only the verified caller's sessions", async () => {
+  const calls = [];
+  const app = makeApp({ register: async () => null, login: async () => null }, {
+    refresh: async () => null, logout: async () => null,
+    logoutAll: async (userId) => { calls.push(userId); return { revokedCount: 3 }; },
+  }, {
+    authenticationMiddleware: (request, _response, next) => {
+      request.auth = { userId: "verified-user-id", role: "USER", authVersion: 4, sessionId: "verified-session-id" };
+      return next();
+    },
+  });
+  await withServer(app, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/v1/auth/logout-all`, { method: "POST" });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), {
+      success: true, message: "All sessions logged out", data: { loggedOut: true, revokedCount: 3 },
+    });
+  });
+  assert.deepEqual(calls, ["verified-user-id"]);
+
+  let unauthenticatedCall = false;
+  const unauthenticatedApp = makeApp({ register: async () => null, login: async () => null }, {
+    logoutAll: async () => { unauthenticatedCall = true; return { revokedCount: 0 }; },
+  });
+  await withServer(unauthenticatedApp, async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/api/v1/auth/logout-all`, { method: "POST" });
+    assert.equal(response.status, 401);
+  });
+  assert.equal(unauthenticatedCall, false);
+});
+
 test("unknown, incorrect and inactive credentials share the same generic login error", async () => {
   const app = makeApp({
     register: async () => null,

@@ -123,20 +123,24 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
       assert.equal(providerCalls, 1);
       assert.equal(await a.paymentAttempt.count({ where: { transactionId: fixture.created.id } }), 1);
     });
-    await t.test("concurrent cancellation cannot win against verified capture processing", async () => {
+    await t.test("concurrent duplicate capture is posted once and conflicting event-ID reuse is quarantined", async () => {
       const fixture = await makeAwaitingPayment(a);
       const key = `pay-${randomUUID()}`; idemKeys.add(key);
       const initiated = await payment(a).initiate({ auth: fixture.authBuyer, transactionId: fixture.created.id, idempotencyKey: key });
       const attempt = await a.paymentAttempt.findFirst({ where: { transactionId: fixture.created.id } });
       assert.equal(attempt.status, "PENDING");
-      const rawBody = Buffer.from(JSON.stringify({ eventId: `evt-${randomUUID()}`, providerReference: attempt.providerReference, outcome: "CAPTURED", amountMinor: attempt.amountMinor.toString(), currency: attempt.currency.trim() }));
+      const eventId = `evt-${randomUUID()}`;
+      const rawBody = Buffer.from(JSON.stringify({ eventId, providerReference: attempt.providerReference, outcome: "CAPTURED", amountMinor: attempt.amountMinor.toString(), currency: attempt.currency.trim() }));
       const signature = adapter.signTestEvent(rawBody);
       const start = barrier();
-      const [capture, cancel] = await Promise.allSettled([
+      const [captureA, captureB, cancel] = await Promise.allSettled([
+        (async () => { await start(); return payment(a, adapter, true).receiveWebhook({ provider: adapter.providerId, rawBody, signature }); })(),
         (async () => { await start(); return payment(b, adapter, true).receiveWebhook({ provider: adapter.providerId, rawBody, signature }); })(),
         (async () => { await start(); return transaction(a).transition({ auth: fixture.authBuyer, transactionId: fixture.created.id, status: "CANCELLED", expectedVersion: 3 }); })(),
       ]);
-      assert.equal(capture.status, "fulfilled");
+      assert.equal(captureA.status, "fulfilled");
+      assert.equal(captureB.status, "fulfilled");
+      assert.equal([captureA, captureB].filter((result) => result.value.duplicate === true).length, 1);
       assert.equal(cancel.status, "rejected");
       const stored = await a.paymentAttempt.findUnique({ where: { id: attempt.id } });
       const current = await a.transaction.findUnique({ where: { id: fixture.created.id }, select: { status: true } });
@@ -145,9 +149,21 @@ test("TB-BE-038 transaction lock serializes cancellation, payment initiation, an
       const fundedEscrow = await a.escrow.findUnique({ where: { transactionId_currency: { transactionId: fixture.created.id, currency: "USD" } } });
       assert.equal(fundedEscrow.balanceMinor, BigInt(initiated.attempt.amountMinor));
       assert.equal(await a.ledgerJournal.count({ where: { transactionId: fixture.created.id } }), 1);
+      assert.equal(await a.escrowOperation.count({ where: { transactionId: fixture.created.id, type: "FUNDING" } }), 1);
+      assert.equal(await a.webhookEvent.count({ where: { paymentAttemptId: attempt.id } }), 1);
       const journal = await a.ledgerJournal.findFirst({ where: { transactionId: fixture.created.id }, include: { entries: true } });
       assert.equal(journal.entries.length, 2);
       assert.equal(journal.entries.reduce((sum, row) => sum + (row.direction === "DEBIT" ? row.amountMinor : -row.amountMinor), 0n), 0n);
+      const acceptedEvent = await a.webhookEvent.findUnique({ where: { provider_providerAccountScope_eventId: { provider: adapter.providerId, providerAccountScope: "default", eventId } } });
+      const acceptedPayload = structuredClone(acceptedEvent.eventData);
+      const conflictingBody = Buffer.from(JSON.stringify({ eventId, providerReference: attempt.providerReference, outcome: "CAPTURED", amountMinor: (attempt.amountMinor + 1n).toString(), currency: attempt.currency.trim() }));
+      const conflictResult = await payment(b).receiveWebhook({ provider: adapter.providerId, rawBody: conflictingBody, signature: adapter.signTestEvent(conflictingBody) });
+      assert.equal(conflictResult.integrityConflict, true);
+      assert.equal(conflictResult.reconciliationRequired, true);
+      const preservedEvent = await a.webhookEvent.findUnique({ where: { id: acceptedEvent.id } });
+      assert.deepEqual(preservedEvent.eventData, acceptedPayload);
+      assert.equal(preservedEvent.lastErrorCode, "EVENT_ID_PAYLOAD_CONFLICT");
+      assert.equal(await a.ledgerJournal.count({ where: { transactionId: fixture.created.id } }), 1);
       preserveFinancialTransactions.add(fixture.created.id);
       preserveFinancialUsers.add(fixture.buyer); preserveFinancialUsers.add(fixture.seller);
       assert.equal(initiated.attempt.amountMinor, "12345");

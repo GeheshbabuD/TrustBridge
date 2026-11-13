@@ -41,6 +41,14 @@ test("disabled adapter does not issue network calls", async () => {
   assert.equal(called, false);
 });
 
+test("checkout configuration exposes only the public key ID and fails closed when disabled", () => {
+  const adapter = createRazorpayPaymentAdapter({ ...options, apiKey: "rzp_test_public_key", apiSecret: "server-only-api-secret" });
+  assert.deepEqual(adapter.getCheckoutConfiguration(), { key: "rzp_test_public_key" });
+  assert.equal(JSON.stringify(adapter.getCheckoutConfiguration()).includes("server-only-api-secret"), false);
+  const disabled = createRazorpayPaymentAdapter({ ...options, enabled: false });
+  assert.throws(() => disabled.getCheckoutConfiguration(), /RAZORPAY_OPERATION_UNAVAILABLE/);
+});
+
 test("payment and raw-body webhook signatures verify with separate secrets", async () => {
   const adapter = createRazorpayPaymentAdapter({ ...options, fetchImpl: async () => jsonResponse({}) });
   assert.equal(adapter.verifyPaymentSignature({ orderId: "order_1", paymentId: "pay_1", signature: signature(options.apiSecret, "order_1|pay_1") }), true);

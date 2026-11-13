@@ -59,7 +59,22 @@ test("isolated PostgreSQL serializes dispute creation and partial refund then se
   await createTransaction(txId, "DELIVERED");
   const acceptedDelivery = await a.transactionDelivery.create({ data: { transactionId: txId, sequence: 1, submittedById: sellerId, description: "synthetic completed delivery" } });
   await a.deliveryDecision.create({ data: { deliveryId: acceptedDelivery.id, actorUserId: buyerId, decision: "ACCEPTED", reason: "synthetic integration fixture" } });
-  await a.escrow.create({ data: { transactionId: txId, currency: "INR", balanceMinor: 9000n, status: "FUNDED" } });
+  const seededEscrow = await a.escrow.create({ data: { transactionId: txId, currency: "INR", balanceMinor: 9000n, status: "FUNDED" } });
+  await a.$transaction(async (tx) => {
+    const clearing = await tx.ledgerAccount.create({ data: { transactionId: txId, currency: "INR", accountCode: "PROVIDER_CLEARING", accountType: "ASSET" } });
+    const liability = await tx.ledgerAccount.create({ data: { transactionId: txId, escrowId: seededEscrow.id, currency: "INR", accountCode: "ESCROW_LIABILITY", accountType: "LIABILITY" } });
+    const journal = await tx.ledgerJournal.create({ data: { transactionId: txId, currency: "INR", operationId: `FUNDING:pg-fixture:${txId}` } });
+    await tx.ledgerEntry.createMany({ data: [
+      { journalId: journal.id, transactionId: txId, currency: "INR", accountId: clearing.id, amountMinor: 9000n, direction: "DEBIT" },
+      { journalId: journal.id, transactionId: txId, currency: "INR", accountId: liability.id, amountMinor: 9000n, direction: "CREDIT" },
+    ] });
+    await tx.escrowOperation.create({ data: {
+      transactionId: txId, escrowId: seededEscrow.id, ledgerJournalId: journal.id,
+      type: "FUNDING", status: "SUCCEEDED", idempotencyKey: `FUNDING:pg-fixture:${txId}`,
+      operationKey: `FUNDING:pg-fixture:${txId}`, amountMinor: 9000n, currency: "INR",
+      reasonCode: "TEST_FIXTURE_FUNDING", completedAt: new Date(),
+    } });
+  });
   await createTransaction(rollbackTxId, "DELIVERED");
 
   const enabledAt = new Date(Date.now() - 60_000); const sessionId = randomUUID();
@@ -83,20 +98,24 @@ test("isolated PostgreSQL serializes dispute creation and partial refund then se
   const adjudication = resolutions.find((result) => result.status === "fulfilled").value;
   assert.equal(adjudication.resolutionAmountMinor, "2500");
   const escrowService = createEscrowService({ getClient: async () => a, refundExecutor: async ({ amountMinor }) => ({ verified: true, outcome: "SUCCEEDED", provider: "test-mock", providerReference: `refund-${amountMinor}`, amountMinor, currency: "INR" }), releaseExecutor: async ({ amountMinor }) => ({ verified: true, outcome: "SUCCEEDED", provider: "test-mock", providerReference: `transfer-${amountMinor}`, amountMinor, currency: "INR" }) });
+  assert.equal((await escrowService.reconcileLedger({ transactionId: txId })).status, "CONSISTENT");
   const refundAuthorization = await escrowService.authorizeRefund({ auth: adminAuth, transactionId: txId, idempotencyKey: "partial-refund-approval-001", reasonCode: "ADMIN_RESOLVED_REFUND" });
   const refundOperation = await a.escrowOperation.findUnique({ where: { id: refundAuthorization.operationId } });
   assert.equal(refundOperation.amountMinor, 2500n); assert.equal(refundOperation.reasonCode, "ADMIN_RESOLVED_PARTIAL_REFUND");
   assert.equal((await escrowService.executeAuthorizedOperation({ operationId: refundOperation.id })).status, "SUCCEEDED");
   assert.equal((await a.escrow.findUnique({ where: { transactionId_currency: { transactionId: txId, currency: "INR" } } })).balanceMinor, 6500n);
   assert.equal((await a.transaction.findUnique({ where: { id: txId } })).status, "DELIVERED");
+  assert.equal((await escrowService.reconcileLedger({ transactionId: txId })).escrowBalanceMinor, "6500");
+  assert.equal((await escrowService.reconcileLedger({ transactionId: txId })).status, "CONSISTENT");
 
   const release = await escrowService.authorizeRelease({ auth: buyerAuth, transactionId: txId, idempotencyKey: "remaining-release-approval-001", reasonCode: "BUYER_ACCEPTED_DELIVERY" });
   assert.equal((await a.escrowOperation.findUnique({ where: { id: release.operationId } })).amountMinor, 6500n);
   assert.equal((await escrowService.executeAuthorizedOperation({ operationId: release.operationId })).status, "SUCCEEDED");
   assert.equal((await a.transaction.findUnique({ where: { id: txId } })).status, "COMPLETED");
   assert.equal((await a.escrow.findUnique({ where: { transactionId_currency: { transactionId: txId, currency: "INR" } } })).balanceMinor, 0n);
+  assert.equal((await escrowService.reconcileLedger({ transactionId: txId })).status, "CONSISTENT");
   assert.equal((await a.dispute.findUnique({ where: { id: created.id } })).status, "CLOSED");
-  assert.equal(await a.ledgerJournal.count({ where: { transactionId: txId } }), 2);
+  assert.equal(await a.ledgerJournal.count({ where: { transactionId: txId } }), 3, "funding, partial refund and release each have one journal");
 
   const collision = await a.transactionStatusHistory.create({ data: { transactionId: rollbackTxId, version: 2, previousStatus: "DELIVERED", newStatus: "DISPUTED", actorUserId: buyerId, reason: "fixture uniqueness collision" } });
   await assert.rejects(makeDisputeService(a).create({ auth: auth(buyerId, "USER"), transactionId: rollbackTxId, input, idempotencyKey: "pg-dispute-rollback-001" }));

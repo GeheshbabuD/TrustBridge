@@ -31,9 +31,9 @@ const productionEnvironment = () => validateEnv({
 
 const testApp = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => { throw new Error("database probe unavailable"); } });
 const defaultWorkerStatus = {
-  notification: { state: "stopped", consecutiveFailures: 0, lastSuccessAt: null, lastFailureAt: null, lastErrorCode: null },
-  escrow: { state: "disabled" },
-  blockchain: { state: "disabled" },
+  notification: { state: "stopped", consecutiveFailures: 0, lastSuccessAt: null, lastFailureAt: null, lastErrorCode: null, required: false },
+  escrow: { state: "disabled", consecutiveFailures: 0, lastSuccessAt: null, lastFailureAt: null, lastErrorCode: null, required: false },
+  blockchain: { state: "disabled", consecutiveFailures: 0, lastSuccessAt: null, lastFailureAt: null, lastErrorCode: null, required: false },
 };
 test("configured blockchain execution fails closed without an approved signer adapter", () => {
   const environment = getEnv();
@@ -130,6 +130,19 @@ test("readiness succeeds when database and required local-environment dependenci
       lifecycle: "unmanaged",
       workers: defaultWorkerStatus,
     });
+  }, readyApp);
+});
+
+test("unmanaged readiness treats a configured escrow worker as required", async () => {
+  const readyApp = createApp(getEnv(), { writeLog: () => {}, checkDatabase: async () => true });
+  readyApp.locals.escrowWorker = { getStatus: () => ({ state: "stopped" }) };
+  await withHttpServer(async (baseUrl) => {
+    const response = await fetch(`${baseUrl}/health/ready`);
+    const payload = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(payload.data.workers.escrow.required, true);
+    assert.equal(payload.data.workers.escrow.state, "stopped");
+    assert.equal((await fetch(`${baseUrl}/health/live`)).status, 200);
   }, readyApp);
 });
 

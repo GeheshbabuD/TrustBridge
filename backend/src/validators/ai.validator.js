@@ -1,5 +1,7 @@
 import { z } from "zod";
 
+export const emptyRequestBodySchema = z.object({}).strict();
+
 const count = z.number().int().min(0).max(1000000);
 export const transactionRiskInputSchema = z.object({
   inputDataVersion: z.literal("transaction-risk.v1"),

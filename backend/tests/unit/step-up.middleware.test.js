@@ -216,6 +216,27 @@ test("one-time step-up grant cannot be replayed", async () => {
   );
 });
 
+test("concurrent requests cannot both consume one one-time grant", async () => {
+  const store = makeTransactionalStore();
+  const middleware = createStepUpAuthorizationMiddleware({
+    purpose: "TEST_ACTION",
+    purposeRegistry: registry,
+    now: () => now,
+    getClient: async () => store.client,
+  });
+
+  const results = await Promise.all([
+    invoke(middleware, validRequest()),
+    invoke(middleware, validRequest()),
+  ]);
+
+  assert.equal(results.filter((error) => error === undefined).length, 1);
+  assert.equal(results.filter((error) => error?.code === "MFA_ASSURANCE_REQUIRED").length, 1);
+  assert.equal(store.calls.updateMany.length, 2);
+  assert.ok(store.challenge.grantConsumedAt instanceof Date);
+  assert.equal(store.challenge.consumedAt.getTime(), verifiedAt.getTime());
+});
+
 test("step-up grant is invalidated when MFA enrollment has been replaced", async () => {
   const oldEnabledAt = new Date("2025-12-01T00:00:00Z");
   const newEnabledAt = new Date("2025-12-02T00:00:00Z");

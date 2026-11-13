@@ -7,6 +7,8 @@ import { createEscrowRouter } from "./escrow.routes.js";
 import { createDisputeRouter } from "./dispute.routes.js";
 import { createAiRouter } from "./ai.routes.js";
 import { createNotificationRouter } from "./notification.routes.js";
+import { createAdminRouter } from "./admin.routes.js";
+import { createMarketplaceRouter } from "./marketplace.routes.js";
 
 export const registerApiRoutes = (app, dependencies = {}) => {
   const apiV1Router = Router();
@@ -18,5 +20,7 @@ export const registerApiRoutes = (app, dependencies = {}) => {
   apiV1Router.use(createDisputeRouter(dependencies));
   apiV1Router.use(createAiRouter(dependencies));
   apiV1Router.use(createNotificationRouter(dependencies));
+  apiV1Router.use(createMarketplaceRouter(dependencies));
+  apiV1Router.use(createAdminRouter(dependencies));
   app.use("/api/v1", apiV1Router);
 };
